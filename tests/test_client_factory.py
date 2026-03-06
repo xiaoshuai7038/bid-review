@@ -27,7 +27,7 @@ def test_backend_switch_create_claude_client() -> None:
     assert client.model == "claude-model"
 
 
-def test_backend_switch_create_opencode_client() -> None:
+def test_backend_switch_create_opencode_client_prefers_opencode_model() -> None:
     backend, client = create_llm_client(
         backend="opencode",
         claude_bin=None,
@@ -46,7 +46,7 @@ def test_backend_switch_create_opencode_client() -> None:
     )
     assert backend == "opencode"
     assert isinstance(client, OpenCodeClient)
-    assert client.model == "common-model"
+    assert client.model == "DeepSeek-V3.2"
     assert client.api_url == "https://ark.cn-beijing.volces.com/api/coding/v3"
     assert client.mcp_config is None
 
@@ -72,6 +72,51 @@ def test_opencode_model_falls_back_to_env_default(monkeypatch) -> None:
     assert backend == "opencode"
     assert isinstance(client, OpenCodeClient)
     assert client.model == "env-model"
+
+
+def test_opencode_model_falls_back_to_common_model() -> None:
+    backend, client = create_llm_client(
+        backend="opencode",
+        claude_bin=None,
+        opencode_bin="opencode",
+        model="common-model",
+        opencode_model=None,
+        effort="low",
+        show_progress=False,
+        progress_level="basic",
+        timeout_sec=10,
+        workspace="D:/code/bidreview",
+        mcp_config=None,
+        opencode_api_key=None,
+        opencode_api_url=None,
+        opencode_provider="ark",
+    )
+    assert backend == "opencode"
+    assert isinstance(client, OpenCodeClient)
+    assert client.model == "common-model"
+
+
+def test_opencode_model_defaults_to_cli_when_unspecified(monkeypatch) -> None:
+    monkeypatch.delenv("BID_REVIEW_OPENCODE_MODEL", raising=False)
+    backend, client = create_llm_client(
+        backend="opencode",
+        claude_bin=None,
+        opencode_bin="opencode",
+        model=None,
+        opencode_model=None,
+        effort="low",
+        show_progress=False,
+        progress_level="basic",
+        timeout_sec=10,
+        workspace="D:/code/bidreview",
+        mcp_config=None,
+        opencode_api_key=None,
+        opencode_api_url=None,
+        opencode_provider="ark",
+    )
+    assert backend == "opencode"
+    assert isinstance(client, OpenCodeClient)
+    assert client.model is None
 
 
 def test_opencode_client_receives_mcp_config() -> None:

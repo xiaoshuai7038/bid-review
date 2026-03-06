@@ -73,7 +73,7 @@ def run_pipeline(
     mcp_config: str | None = None,
     opencode_api_key: str | None = None,
     opencode_api_url: str | None = None,
-    opencode_provider: str = "ark",
+    opencode_provider: str = "volcengine",
     save_raw_output: bool = True,
 ) -> BatchArtifacts:
     bid_paths = bid_paths or []

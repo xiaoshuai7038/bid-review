@@ -58,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--opencode-model",
         type=str,
         default=None,
-        help="可选，仅 opencode 后端使用。若未传则回退到 --model，再回退到环境变量/默认值。",
+        help="可选，仅 opencode 后端使用。若未传则回退到 --model，再回退到环境变量；都未传时沿用本机 OpenCode 默认模型配置。",
     )
     parser.add_argument(
         "--opencode-bin",
@@ -69,14 +69,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--opencode-provider",
         type=str,
-        default=os.getenv("BID_REVIEW_OPENCODE_PROVIDER", "ark"),
+        default=os.getenv("BID_REVIEW_OPENCODE_PROVIDER", "volcengine"),
         help="可选，仅 opencode 后端使用的 provider 标识。",
     )
     parser.add_argument(
         "--opencode-api-url",
         type=str,
-        default=os.getenv("BID_REVIEW_OPENCODE_API_URL", "https://ark.cn-beijing.volces.com/api/coding/v3"),
-        help="可选，仅 opencode 后端使用的 OpenAI-compatible base URL。",
+        default=os.getenv("BID_REVIEW_OPENCODE_API_URL"),
+        help="可选，仅 opencode 后端使用的 OpenAI-compatible base URL；未传则沿用本机 OpenCode 配置。",
     )
     parser.add_argument(
         "--opencode-api-key",

@@ -36,10 +36,12 @@ class _FakeClient:
         self._last_tool_uses: list[dict[str, Any]] = []
         self._last_tool_calls: list[str] = []
         self.ask_text_calls = 0
+        self.prompts: list[str] = []
 
     def ask_text(self, prompt: str, *, task_label: str | None = None) -> str:
         idx = self.ask_text_calls
         self.ask_text_calls += 1
+        self.prompts.append(prompt)
         self._last_tool_uses = self._tool_uses_seq[min(idx, len(self._tool_uses_seq) - 1)]
         self._last_tool_calls = [str(x.get("name", "")) for x in self._last_tool_uses]
         return self._outputs[min(idx, len(self._outputs) - 1)]
@@ -228,6 +230,44 @@ def test_run_bid_review_pdf_keeps_legacy_non_ocr_flow(
     )
     assert client.ask_text_calls == 1
     assert report["summary"]["requirement_count"] >= 1
+
+
+def test_run_bid_review_second_pass_prompt_uses_absolute_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("BID_REVIEW_ENABLE_SECOND_PASS", "1")
+
+    client = _FakeClient(
+        outputs=[
+            _json_result(),
+            json.dumps({"additional_findings": []}, ensure_ascii=False),
+        ],
+        tool_uses_seq=[
+            [{"name": "Read", "input": {"path": "x"}}],
+            [{"name": "Read", "input": {"path": "x"}}],
+        ],
+    )
+
+    tender_path = tmp_path / "nested" / "tender.pdf"
+    bid_path = tmp_path / "other" / "bid.pdf"
+    tender_path.parent.mkdir(parents=True, exist_ok=True)
+    bid_path.parent.mkdir(parents=True, exist_ok=True)
+    tender_path.write_bytes(b"%PDF-1.4")
+    bid_path.write_bytes(b"%PDF-1.4")
+
+    run_bid_review_with_claude(
+        tender_path=str(tender_path),
+        bid_path=str(bid_path),
+        client=client,
+        extra_instruction="",
+        user_instruction="",
+    )
+
+    assert client.ask_text_calls == 2
+    second_prompt = client.prompts[1]
+    assert f"- 招标文件: {tender_path.resolve()}" in second_prompt
+    assert f"- 投标文件: {bid_path.resolve()}" in second_prompt
 
 
 def test_stability_guards_keep_known_subject_mismatch_pattern() -> None:

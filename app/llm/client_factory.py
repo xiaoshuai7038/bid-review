@@ -64,12 +64,7 @@ def create_llm_client(
             mcp_config=mcp_config,
         )
 
-    resolved_model = (
-        model
-        or opencode_model
-        or os.getenv("BID_REVIEW_OPENCODE_MODEL")
-        or "DeepSeek-V3.2"
-    )
+    resolved_model = opencode_model or model or os.getenv("BID_REVIEW_OPENCODE_MODEL")
     return selected, OpenCodeClient(
         opencode_bin=opencode_bin,
         model=resolved_model,

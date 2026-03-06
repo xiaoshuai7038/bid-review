@@ -33,7 +33,7 @@ class OpenCodeClient:
     agent: str | None = None
     api_key: str | None = None
     api_url: str | None = None
-    provider_id: str = "ark"
+    provider_id: str = "volcengine"
     mcp_config: str | None = None
     _last_tool_calls: list[str] = field(default_factory=list, init=False, repr=False)
     _last_tool_uses: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
@@ -285,6 +285,23 @@ class OpenCodeClient:
         cmd.append(prompt)
         return cmd
 
+    @staticmethod
+    def _extract_error_message(event: dict[str, Any]) -> str:
+        error = event.get("error")
+        if isinstance(error, dict):
+            data = error.get("data")
+            if isinstance(data, dict):
+                message = str(data.get("message") or "").strip()
+                if message:
+                    return message
+            message = str(error.get("message") or "").strip()
+            if message:
+                return message
+            name = str(error.get("name") or "").strip()
+            if name:
+                return name
+        return "未知错误"
+
     def _emit_progress(self, message: str, level: str = "normal") -> None:
         if not self.show_progress:
             return
@@ -374,15 +391,17 @@ class OpenCodeClient:
                 proc.kill()
                 raise OpenCodeCallError(f"OpenCode 调用超时（>{self.timeout_sec}s）")
 
+            got_stdout_item = False
             line: str | None = None
             try:
                 line = stdout_queue.get(timeout=1)
+                got_stdout_item = True
             except queue.Empty:
-                pass
+                got_stdout_item = False
 
-            if line is None:
+            if got_stdout_item and line is None:
                 stdout_done = True
-            elif line is not None:
+            elif got_stdout_item and line is not None:
                 raw_line = line.rstrip("\n")
                 raw_lines.append(raw_line)
                 event: dict[str, Any] | None = None
@@ -400,6 +419,14 @@ class OpenCodeClient:
                     event_type = str(event.get("type", "")).lower()
                     if self.progress_level == "events":
                         self._emit_progress(raw_line, level="events")
+                    if event_type == "error":
+                        try:
+                            proc.kill()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        raise OpenCodeCallError(
+                            f"OpenCode 返回错误事件: {self._extract_error_message(event)}"
+                        )
                     part = event.get("part", {})
                     if not isinstance(part, dict):
                         part = {}

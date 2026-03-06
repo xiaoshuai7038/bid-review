@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -49,6 +50,25 @@ def test_opencode_parse_invalid_json_output_fails(monkeypatch: pytest.MonkeyPatc
         client.ask_json("仅用于测试", required_top_keys=["requirements"], max_retries=0)
 
 
+def test_opencode_base_cmd_omits_model_when_unspecified() -> None:
+    client = OpenCodeClient(
+        opencode_bin="opencode",
+        model=None,
+        workspace="D:/code/bidreview",
+        provider_id="ark",
+        show_progress=False,
+    )
+
+    assert client._base_cmd() == [
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--dir",
+        "D:/code/bidreview",
+    ]
+
+
 def test_opencode_ask_text_sends_prompt_as_message_arg(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
 
@@ -94,6 +114,75 @@ def test_opencode_ask_text_sends_prompt_as_message_arg(monkeypatch: pytest.Monke
         "D:/code/bidreview",
         "请输出JSON",
     ]
+
+
+def test_opencode_ask_text_raises_on_error_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs) -> None:
+            self.stdout = io.StringIO(
+                '{"type":"error","error":{"name":"UnknownError","data":{"message":"Model not found: ark/DeepSeek-V3.2."}}}\n'
+            )
+            self.stderr = io.StringIO("")
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self, timeout=None) -> int:
+            return 0
+
+        def kill(self) -> None:
+            return None
+
+    monkeypatch.setattr("app.llm.opencode_client.subprocess.Popen", _FakePopen)
+
+    client = OpenCodeClient(
+        opencode_bin="opencode",
+        model="DeepSeek-V3.2",
+        workspace="D:/code/bidreview",
+        provider_id="ark",
+        show_progress=False,
+    )
+
+    with pytest.raises(OpenCodeCallError, match="Model not found: ark/DeepSeek-V3.2."):
+        client.ask_text("请输出JSON")
+
+
+def test_opencode_ask_text_waits_for_delayed_first_stdout_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    stdout_stream = object()
+    stderr_stream = object()
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs) -> None:
+            self.stdout = stdout_stream
+            self.stderr = stderr_stream
+
+        def poll(self) -> int | None:
+            return 0
+
+        def wait(self, timeout=None) -> int:
+            return 0
+
+        def kill(self) -> None:
+            return None
+
+    def _fake_reader_thread(stream, out_queue) -> None:
+        time.sleep(1.2)
+        if stream is stdout_stream:
+            out_queue.put('{"type":"text","part":{"text":"delayed"}}\n')
+        out_queue.put(None)
+
+    monkeypatch.setattr("app.llm.opencode_client.subprocess.Popen", _FakePopen)
+    monkeypatch.setattr(OpenCodeClient, "_reader_thread", staticmethod(_fake_reader_thread))
+
+    client = OpenCodeClient(
+        opencode_bin="opencode",
+        model=None,
+        workspace="D:/code/bidreview",
+        provider_id="ark",
+        show_progress=False,
+    )
+
+    assert client.ask_text("请输出JSON") == "delayed"
 
 
 def test_opencode_build_runtime_env_converts_claude_mcp_config() -> None:

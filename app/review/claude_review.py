@@ -1530,6 +1530,8 @@ def run_bid_review_with_claude(
         workspace_dir=workspace_dir,
         tender_stem=tender_stem,
         bid_stem=bid_stem,
+        tender_path=str(tender_path_obj),
+        bid_path=str(bid_path_obj),
         user_instruction=user_ins,
         instruction=instruction,
     )
@@ -1676,6 +1678,8 @@ def run_bid_review_with_claude(
         workspace_dir=workspace_dir,
         tender_stem=tender_stem,
         bid_stem=bid_stem,
+        tender_path=str(tender_path_obj),
+        bid_path=str(bid_path_obj),
         user_instruction=user_ins,
         initial_json=initial_json,
     )

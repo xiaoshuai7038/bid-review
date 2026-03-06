@@ -76,7 +76,7 @@ uv run python -m app.main `
   --backend opencode `
   --input "C:\path\to\tender-document.pdf" `
   --input "C:\path\to\bid-document.docx" `
-  --opencode-provider "ark" `
+  --opencode-provider "volcengine" `
   --opencode-api-url "https://ark.cn-beijing.volces.com/api/coding/v3" `
   --opencode-model "DeepSeek-V3.2" `
   --opencode-api-key "<your-api-key>" `
@@ -243,6 +243,6 @@ uv run python -m app.main `
 - 若后端返回格式异常，程序会报错并保留 `claude_raw_output.txt` 便于排查。
 - 默认后端是 `claude`；可用 `--backend opencode` 切换。
 - 默认不显式指定 Claude 模型，直接使用你本机 Claude CLI 已配置的默认模型；如需临时覆盖可传 `--model`。
-- OpenCode 可通过 `--opencode-provider/--opencode-api-url/--opencode-model/--opencode-api-key` 传入模型与网关配置。
+- 默认不显式指定 OpenCode 模型与网关时，沿用你本机 OpenCode 已配置的默认值；如需临时覆盖，可传 `--opencode-provider/--opencode-api-url/--opencode-model/--opencode-api-key`。
 - 提示词已配置化，位于 `app/llm/prompts/`（可直接修改模板）。
 - 可通过环境变量 `BID_REVIEW_PROMPTS_DIR` 指向自定义提示词目录（文件名需保持一致）。
