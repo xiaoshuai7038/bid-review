@@ -13,7 +13,6 @@ from docx import Document
 
 from app.llm.claude_client import (
     ClaudeCallError,
-    ClaudeClient,
     compact_text_for_prompt,
     extract_json_payload,
     prompt_safe_path,
@@ -65,10 +64,31 @@ _CONTEXT_FINDING_KEYWORDS = (
 )
 
 
+_IMAGE_SUFFIXES = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".gif",
+}
+
+
 def _instruction_requires_ocr(user_instruction: str, extra_instruction: str) -> bool:
     text = f"{user_instruction}\n{extra_instruction}".lower()
     keywords = ["ocr", "图片", "截图", "图像", "扫描", "证据图", "影像"]
     return any(k in text for k in keywords)
+
+
+def _docx_ocr_required_by_default() -> bool:
+    return os.getenv("BID_REVIEW_DOCX_OCR_REQUIRED", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 def _has_ocr_tool_call(tool_calls: list[str]) -> bool:
@@ -94,6 +114,8 @@ def _has_word_batch_ocr_call(tool_calls: list[str]) -> bool:
         n = str(name).lower()
         if "ocr_images_in_dir" in n:
             return True
+        if "perform_batch_ocr" in n:
+            return True
     return False
 
 
@@ -101,8 +123,10 @@ def _append_ocr_enforcement(prompt: str, *, require_word_extract: bool) -> str:
     extra = ""
     if require_word_extract:
         extra = (
-            "\n你必须先调用 `document-parser.extract_images_from_word`（或 `mcp__document-parser__extract_images_from_word`），"
-            "再调用 `paddle-ocr.ocr_images_in_dir`（或 `mcp__paddle-ocr__ocr_images_in_dir`）对提取目录的全部图片完成OCR。"
+            "\n你必须先使用 `document-parser` MCP 服务器中的 Word 图片提取工具"
+            "（如 `document-parser.extract_images_from_word` 或 `mcp__document-parser__extract_images_from_word`），"
+            "再使用 `paddle-ocr` MCP 服务器中的批量图片 OCR 工具"
+            "（如 `paddle-ocr.ocr_images_in_dir` 或 `mcp__paddle-ocr__ocr_images_in_dir`）对提取目录的全部图片完成OCR。"
         )
     enforce = """
 
@@ -172,6 +196,7 @@ def _has_forbidden_shell_redirection(command: str) -> bool:
 
 def _has_forbidden_write_tool_call(tool_uses: list[dict[str, Any]]) -> bool:
     shell_markers = ("bash", "shell", "powershell", "terminal", "command", "exec")
+    direct_write_markers = ("write", "edit", "multiedit")
     forbidden_patterns = [
         r"(?<![\w.-])out-file(?![\w.-])",
         r"(?<![\w.-])set-content(?![\w.-])",
@@ -190,6 +215,12 @@ def _has_forbidden_write_tool_call(tool_uses: list[dict[str, Any]]) -> bool:
     ]
     for call in tool_uses:
         name = str(call.get("name", "")).lower()
+        if name in direct_write_markers:
+            return True
+        if name.endswith("__write") or name.endswith("_write") or name.endswith(".write"):
+            return True
+        if "__write_file" in name or "_write_file" in name or "create_file" in name:
+            return True
         if not any(m in name for m in shell_markers):
             continue
         command_text = _extract_shell_command_text(call.get("input")).lower()
@@ -207,6 +238,159 @@ def _strict_fail_on_forbidden_write() -> bool:
         "yes",
         "on",
     }
+
+
+def _iter_tool_input_strings(value: Any) -> list[str]:
+    out: list[str] = []
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, dict):
+        for v in value.values():
+            out.extend(_iter_tool_input_strings(v))
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            out.extend(_iter_tool_input_strings(item))
+    return out
+
+
+def _to_path_candidate(raw_text: str) -> Path | None:
+    text = raw_text.strip().strip("\"'")
+    text = text.rstrip(".,;)]}")
+    if not text:
+        return None
+    lower = text.lower()
+    if lower.startswith(("http://", "https://", "{env:", "env:")):
+        return None
+    has_drive = bool(re.match(r"^[a-zA-Z]:[\\/]", text))
+    has_sep = "/" in text or "\\" in text
+    has_ext = bool(Path(text).suffix)
+    if not (has_drive or has_sep or has_ext):
+        return None
+    path_obj = Path(text).expanduser()
+    if not path_obj.is_absolute():
+        path_obj = (Path.cwd() / path_obj).resolve(strict=False)
+    else:
+        path_obj = path_obj.resolve(strict=False)
+    return path_obj
+
+
+def _iter_path_candidates(tool_input: Any) -> list[Path]:
+    out: list[Path] = []
+    for text in _iter_tool_input_strings(tool_input):
+        path_obj = _to_path_candidate(text)
+        if path_obj is not None:
+            out.append(path_obj)
+    return out
+
+
+def _is_image_file(path_obj: Path) -> bool:
+    return path_obj.suffix.lower() in _IMAGE_SUFFIXES
+
+
+def _canonical_path(path_obj: Path) -> str:
+    return str(path_obj.resolve(strict=False)).replace("\\", "/").lower()
+
+
+def _list_image_files(directory: Path) -> list[Path]:
+    if not directory.exists() or not directory.is_dir():
+        return []
+    out: list[Path] = []
+    try:
+        for p in directory.rglob("*"):
+            if p.is_file() and _is_image_file(p):
+                out.append(p.resolve(strict=False))
+    except OSError:
+        return []
+    return out
+
+
+def _collect_extracted_images_from_tool_uses(tool_uses: list[dict[str, Any]]) -> set[str]:
+    images: set[str] = set()
+    for call in tool_uses:
+        name = str(call.get("name", "")).lower()
+        if "extract_images_from_word" not in name:
+            continue
+        for path_obj in _iter_path_candidates(call.get("input")):
+            if path_obj.suffix.lower() == ".docx":
+                continue
+            if path_obj.exists() and path_obj.is_file() and _is_image_file(path_obj):
+                images.add(_canonical_path(path_obj))
+                continue
+            if path_obj.exists() and path_obj.is_dir():
+                for image in _list_image_files(path_obj):
+                    images.add(_canonical_path(image))
+    return images
+
+
+def _collect_ocr_target_images_from_tool_uses(tool_uses: list[dict[str, Any]]) -> set[str]:
+    images: set[str] = set()
+    for call in tool_uses:
+        name = str(call.get("name", "")).lower()
+        if "ocr_images_in_dir" not in name and "perform_batch_ocr" not in name:
+            continue
+        paths = _iter_path_candidates(call.get("input"))
+        explicit_images = [p for p in paths if _is_image_file(p)]
+        if explicit_images:
+            for image in explicit_images:
+                images.add(_canonical_path(image))
+            continue
+        for path_obj in paths:
+            if path_obj.exists() and path_obj.is_dir():
+                for image in _list_image_files(path_obj):
+                    images.add(_canonical_path(image))
+    return images
+
+
+def _count_docx_embedded_images(docx_path: Path) -> int:
+    if not docx_path.exists() or not docx_path.is_file():
+        return 0
+    try:
+        with zipfile.ZipFile(docx_path, "r") as zf:
+            names = zf.namelist()
+    except Exception:  # noqa: BLE001
+        return 0
+    count = 0
+    for name in names:
+        lowered = name.lower()
+        if not lowered.startswith("word/media/"):
+            continue
+        suffix = Path(lowered).suffix
+        if suffix in _IMAGE_SUFFIXES:
+            count += 1
+    return count
+
+
+def _validate_docx_ocr_coverage(tool_uses: list[dict[str, Any]], *, bid_path: Path) -> tuple[bool, str]:
+    extracted_images = _collect_extracted_images_from_tool_uses(tool_uses)
+    ocr_images = _collect_ocr_target_images_from_tool_uses(tool_uses)
+
+    if extracted_images:
+        if not ocr_images:
+            return False, "无法统计 OCR 覆盖数量（未识别到 ocr_images_in_dir/perform_batch_ocr 的目标图片）。"
+        missing = sorted(extracted_images - ocr_images)
+        if missing:
+            covered = len(extracted_images) - len(missing)
+            sample = ", ".join([Path(x).name for x in missing[:3]])
+            return (
+                False,
+                f"Word提图共{len(extracted_images)}张，OCR覆盖{covered}张，缺少{len(missing)}张（示例: {sample}）。",
+            )
+        return True, f"Word提图共{len(extracted_images)}张，OCR已全量覆盖。"
+
+    expected_count = _count_docx_embedded_images(bid_path)
+    if expected_count <= 0:
+        return True, "Word未检测到内嵌图片，跳过图片OCR覆盖校验。"
+    if not ocr_images:
+        return False, (
+            "无法统计 OCR 覆盖数量（未识别到 ocr_images_in_dir/perform_batch_ocr 的目标图片），"
+            f"但 Word 内嵌图片共{expected_count}张。"
+        )
+    if len(ocr_images) < expected_count:
+        return (
+            False,
+            f"Word内嵌图片共{expected_count}张，OCR目标仅识别到{len(ocr_images)}张，存在未覆盖图片。",
+        )
+    return True, f"Word内嵌图片共{expected_count}张，OCR目标识别到{len(ocr_images)}张，满足全量覆盖。"
 
 
 def _normalize_requirements(raw: Any) -> list[dict[str, Any]]:
@@ -628,7 +812,6 @@ _FINDING_THEME_RULES: list[dict[str, Any]] = [
         "key": "subject_mismatch",
         "match_groups": [
             ("投标函", "投标人", "招标人"),
-            ("投标函", "投标人", "示例招标人有限公司"),
             ("主体", "错位"),
         ],
         "canonical_issue": "投标函落款处投标人名称误写为招标人名称，主体信息错位。",
@@ -873,6 +1056,27 @@ def _apply_docx_stability_guards_from_text(
     *,
     force_manual_image_checks: bool = False,
 ) -> dict[str, Any]:
+    def _normalize_labeled_party(value: str) -> str:
+        text = str(value or "").strip()
+        text = re.split(r"[\r\n]", text, maxsplit=1)[0]
+        text = re.sub(r"[（(](?:盖[^）)]*|签[^）)]*|签章[^）)]*)[）)]\s*$", "", text)
+        text = re.split(r"(?:联系人|联系电话|地址|电话|邮编)\s*[:：]", text, maxsplit=1)[0]
+        text = text.strip("`'\"：:，,。.;； ")
+        return re.sub(r"\s+", "", text)
+
+    def _extract_labeled_parties(text: str, labels: tuple[str, ...]) -> set[str]:
+        out: set[str] = set()
+        label_group = "|".join(re.escape(label) for label in labels)
+        pattern = re.compile(
+            rf"(?:{label_group})\s*[:：]\s*([^\r\n]{{2,120}})",
+            flags=re.IGNORECASE,
+        )
+        for match in pattern.finditer(text):
+            normalized = _normalize_labeled_party(match.group(1))
+            if len(normalized) >= 4:
+                out.add(normalized)
+        return out
+
     if not docx_text:
         return report
 
@@ -989,7 +1193,12 @@ def _apply_docx_stability_guards_from_text(
     compact = _compact_token_text(docx_text)
 
     # 1) 投标函落款主体错位（明确不符合）
-    if re.search(r"投标函.{0,2600}投标人[:：]示例招标人有限公司", compact):
+    tender_party_names = _extract_labeled_parties(docx_text, ("招标人", "采购人"))
+    bid_letter_party_names = _extract_labeled_parties(
+        re.search(r"投标函[\s\S]{0,2600}", docx_text).group(0) if re.search(r"投标函[\s\S]{0,2600}", docx_text) else "",
+        ("投标人",),
+    )
+    if tender_party_names and any(name in tender_party_names for name in bid_letter_party_names):
         _upsert_guard_finding(
             report,
             requirement_id=context_req_id,
@@ -999,16 +1208,16 @@ def _apply_docx_stability_guards_from_text(
                 context_req_id,
                 "投标文件关键主体名词必须与所在位置和语义角色一致。",
             ),
-            bid_evidence="投标函落款页：`投标人：示例招标人有限公司（盖公章）`，与投标人主体不一致。",
+            bid_evidence="投标函落款页：检测到“投标人”字段值与文内“招标人/采购人”字段值一致，主体不一致。",
             recommendation="将投标函落款处投标人名称更正为投标人法定全称，并复核同页签章信息。",
             match_groups=[
-                ("投标函", "投标人", "示例招标人有限公司"),
+                ("投标函", "投标人", "招标人"),
                 ("投标函", "落款", "主体"),
             ],
         )
 
     # 2) 商务投标文件封面公司名称缺字（明确不符合）
-    if "示例科技有限责任司" in docx_text:
+    if "有限责任司" in docx_text:
         _upsert_guard_finding(
             report,
             requirement_id=context_req_id,
@@ -1018,7 +1227,7 @@ def _apply_docx_stability_guards_from_text(
                 context_req_id,
                 "投标文件关键主体名词必须与所在位置和语义角色一致。",
             ),
-            bid_evidence="商务投标文件封面：`投标人：示例科技有限责任司（盖单位公章）`，公司名称不完整。",
+            bid_evidence="商务投标文件封面：检测到 `有限责任司` 异常，公司名称疑似缺少“公”字。",
             recommendation="将封面公司名称更正为营业执照一致的法定全称，并统一检查全文件主体名称。",
             match_groups=[
                 ("有限责任司",),
@@ -1216,7 +1425,8 @@ def _apply_stability_guards(
     )
 
 
-def detect_roles_with_claude(paths: list[str], client: ClaudeClient) -> tuple[str, str, str]:
+def detect_roles_with_claude(paths: list[str], client: Any) -> tuple[str, str, str]:
+    backend_name = "OpenCode" if client.__class__.__name__.lower().startswith("opencode") else "Claude"
     docs = []
     for idx, p in enumerate(paths, start=1):
         path = Path(p).resolve()
@@ -1229,7 +1439,7 @@ def detect_roles_with_claude(paths: list[str], client: ClaudeClient) -> tuple[st
         task_label="识别招标文件与投标文件",
     )
     if not isinstance(data, dict):
-        raise ValueError("Claude 返回格式错误，无法识别招投标文件。")
+        raise ValueError(f"{backend_name} 返回格式错误，无法识别招投标文件。")
     tender_id = str(data["tender_id"])
     bid_id = str(data["bid_id"])
     reasoning = str(data.get("reasoning", ""))
@@ -1247,14 +1457,15 @@ def detect_roles_with_claude(paths: list[str], client: ClaudeClient) -> tuple[st
         reasoning = f"{reasoning}; fallback-by-filename"
 
     if str(Path(tender_path).resolve()) == str(Path(bid_path).resolve()):
-        raise ValueError("Claude 未能区分招标与投标文件。")
+        raise ValueError(f"{backend_name} 未能区分招标与投标文件。")
     return tender_path, bid_path, reasoning
 
 
 def detect_tender_and_bids_with_claude(
     paths: list[str],
-    client: ClaudeClient,
+    client: Any,
 ) -> tuple[str, list[str], str]:
+    backend_name = "OpenCode" if client.__class__.__name__.lower().startswith("opencode") else "Claude"
     docs = []
     for idx, p in enumerate(paths, start=1):
         path = Path(p).resolve()
@@ -1267,7 +1478,7 @@ def detect_tender_and_bids_with_claude(
         task_label="识别招标文件与多个投标文件",
     )
     if not isinstance(data, dict):
-        raise ValueError("Claude 返回格式错误，无法识别招投标文件。")
+        raise ValueError(f"{backend_name} 返回格式错误，无法识别招投标文件。")
     tender_id = str(data.get("tender_id", ""))
     bid_ids_raw = data.get("bid_ids", [])
     reasoning = str(data.get("reasoning", ""))
@@ -1302,10 +1513,11 @@ def run_bid_review_with_claude(
     *,
     tender_path: str,
     bid_path: str,
-    client: ClaudeClient,
+    client: Any,
     extra_instruction: str = "",
     user_instruction: str = "",
 ) -> tuple[dict[str, Any], str]:
+    backend_name = "OpenCode" if client.__class__.__name__.lower().startswith("opencode") else "Claude"
     tender_path_obj = Path(tender_path).resolve()
     bid_path_obj = Path(bid_path).resolve()
     workspace_dir = prompt_safe_path(str(tender_path_obj.parent))
@@ -1321,8 +1533,11 @@ def run_bid_review_with_claude(
         user_instruction=user_ins,
         instruction=instruction,
     )
-    ocr_required = _instruction_requires_ocr(user_instruction, extra_instruction)
     require_word_extract = bid_path_obj.suffix.lower() == ".docx"
+    ocr_required = _instruction_requires_ocr(user_instruction, extra_instruction) or (
+        require_word_extract and _docx_ocr_required_by_default()
+    )
+    word_ocr_fully_covered = not (ocr_required and require_word_extract)
     original_timeout = client.timeout_sec
     # OCR全量处理（特别是docx图片较多时）需要更长超时，避免中途失败。
     if ocr_required and require_word_extract and client.timeout_sec < 7200:
@@ -1335,14 +1550,30 @@ def run_bid_review_with_claude(
         has_ocr = _has_ocr_tool_call(first_calls)
         has_word_extract = _has_word_image_extract_call(first_calls) if require_word_extract else True
         has_word_batch_ocr = _has_word_batch_ocr_call(first_calls) if require_word_extract else True
+        word_ocr_coverage_ok = True
+        word_ocr_coverage_detail = ""
+        if ocr_required and require_word_extract and has_word_extract and has_word_batch_ocr:
+            word_ocr_coverage_ok, word_ocr_coverage_detail = _validate_docx_ocr_coverage(
+                first_uses,
+                bid_path=bid_path_obj,
+            )
         has_forbidden_write = _has_forbidden_write_tool_call(first_uses)
         need_retry = has_forbidden_write or (
-            ocr_required and (not has_ocr or not has_word_extract or not has_word_batch_ocr)
+            ocr_required and (not has_ocr or not has_word_extract or not has_word_batch_ocr or not word_ocr_coverage_ok)
         )
         if need_retry:
             retry_prompt = prompt
-            if ocr_required and (not has_ocr or not has_word_extract or not has_word_batch_ocr):
+            if ocr_required and (
+                not has_ocr or not has_word_extract or not has_word_batch_ocr or not word_ocr_coverage_ok
+            ):
                 retry_prompt = _append_ocr_enforcement(retry_prompt, require_word_extract=require_word_extract)
+            if require_word_extract and not word_ocr_coverage_ok and word_ocr_coverage_detail:
+                retry_prompt = (
+                    retry_prompt
+                    + "\n你上一次未完成 Word 提图全量 OCR。"
+                    + word_ocr_coverage_detail
+                    + "请严格覆盖提图目录中的全部图片。"
+                )
             if has_forbidden_write:
                 retry_prompt = _append_no_write_enforcement(retry_prompt)
             retry_output = client.ask_text(retry_prompt, task_label=f"初审重试(约束强制)：{bid_path_obj.name}")
@@ -1351,6 +1582,13 @@ def run_bid_review_with_claude(
             has_ocr = _has_ocr_tool_call(retry_calls)
             has_word_extract = _has_word_image_extract_call(retry_calls) if require_word_extract else True
             has_word_batch_ocr = _has_word_batch_ocr_call(retry_calls) if require_word_extract else True
+            word_ocr_coverage_ok = True
+            word_ocr_coverage_detail = ""
+            if ocr_required and require_word_extract and has_word_extract and has_word_batch_ocr:
+                word_ocr_coverage_ok, word_ocr_coverage_detail = _validate_docx_ocr_coverage(
+                    retry_uses,
+                    bid_path=bid_path_obj,
+                )
             has_forbidden_write = _has_forbidden_write_tool_call(retry_uses)
             if not has_ocr or not has_word_extract or not has_word_batch_ocr:
                 need = []
@@ -1363,9 +1601,19 @@ def run_bid_review_with_claude(
                 raise ClaudeCallError(
                     f"审查阶段缺少必要MCP调用（{', '.join(need)}），已按强制规则重试1次仍失败。"
                 )
+            if require_word_extract and not word_ocr_coverage_ok:
+                raise ClaudeCallError(
+                    f"Word图片OCR未全量覆盖，已按强制规则重试1次仍失败。{word_ocr_coverage_detail}"
+                )
             if has_forbidden_write and _strict_fail_on_forbidden_write():
                 raise ClaudeCallError("审查阶段检测到写文件/脚本执行行为，已按只读规则重试1次仍失败。")
             raw_output = retry_output
+        elif ocr_required and require_word_extract and not word_ocr_coverage_ok:
+            raise ClaudeCallError(
+                f"Word图片OCR未全量覆盖。{word_ocr_coverage_detail}"
+            )
+        if ocr_required and require_word_extract:
+            word_ocr_fully_covered = word_ocr_coverage_ok
     finally:
         client.timeout_sec = original_timeout
     try:
@@ -1382,10 +1630,10 @@ def run_bid_review_with_claude(
             + json.dumps(data, ensure_ascii=False, indent=2)
         )
     if not isinstance(data, dict):
-        raise ValueError("Claude 返回的审查结果不是 JSON 对象。")
+        raise ValueError(f"{backend_name} 返回的审查结果不是 JSON 对象。")
     for key in ("requirements", "findings", "summary"):
         if key not in data:
-            raise ValueError(f"Claude 返回缺少关键字段: {key}")
+            raise ValueError(f"{backend_name} 返回缺少关键字段: {key}")
     report = normalize_review_report(data)
     report = _ensure_context_consistency_requirement(report)
     valid_req_ids = {str(r.get("id", "")) for r in report.get("requirements", [])}
@@ -1410,11 +1658,12 @@ def run_bid_review_with_claude(
         "yes",
         "on",
     }
+    force_manual_image_checks = require_word_extract and ocr_required and (not word_ocr_fully_covered)
     if not enable_second_pass:
         report = _apply_stability_guards(
             report,
             bid_path=bid_path_obj,
-            force_manual_image_checks=ocr_required,
+            force_manual_image_checks=force_manual_image_checks,
         )
         merged_raw = f"{raw_output}\n\n[SECOND_PASS]\nSKIPPED_BY_DEFAULT"
         return report, merged_raw
@@ -1467,7 +1716,7 @@ def run_bid_review_with_claude(
     report = _apply_stability_guards(
         report,
         bid_path=bid_path_obj,
-        force_manual_image_checks=ocr_required,
+        force_manual_image_checks=force_manual_image_checks,
     )
 
     merged_raw = f"{raw_output}\n\n[SECOND_PASS]\n{second_raw}"

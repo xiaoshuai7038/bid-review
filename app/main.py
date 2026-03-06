@@ -24,13 +24,20 @@ def _merge_non_empty(parts: list[str]) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="将招标/投标文件交给 Claude CLI 执行标书审查并输出报告。"
+        description="将招标/投标文件交给 Claude/OpenCode CLI 执行标书审查并输出报告。"
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="claude",
+        choices=["claude", "opencode"],
+        help="选择执行后端，默认 claude。",
     )
     parser.add_argument(
         "--input",
         action="append",
         default=[],
-        help="输入文件路径，可重复传入。若不指定 --tender/--bid，会由 Claude 自动识别角色（支持1招标+N投标）。",
+        help="输入文件路径，可重复传入。若不指定 --tender/--bid，会由所选后端自动识别角色（支持1招标+N投标）。",
     )
     parser.add_argument("--tender", type=str, default=None, help="招标文件路径。")
     parser.add_argument("--bid", action="append", default=[], help="投标文件路径，可重复传入多个。")
@@ -45,7 +52,37 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         type=str,
         default=None,
-        help="可选，覆盖 Claude CLI 默认模型配置。",
+        help="可选，覆盖后端默认模型配置（claude/opencode 通用）。",
+    )
+    parser.add_argument(
+        "--opencode-model",
+        type=str,
+        default=None,
+        help="可选，仅 opencode 后端使用。若未传则回退到 --model，再回退到环境变量/默认值。",
+    )
+    parser.add_argument(
+        "--opencode-bin",
+        type=str,
+        default=None,
+        help="可选，opencode 可执行文件路径。",
+    )
+    parser.add_argument(
+        "--opencode-provider",
+        type=str,
+        default=os.getenv("BID_REVIEW_OPENCODE_PROVIDER", "ark"),
+        help="可选，仅 opencode 后端使用的 provider 标识。",
+    )
+    parser.add_argument(
+        "--opencode-api-url",
+        type=str,
+        default=os.getenv("BID_REVIEW_OPENCODE_API_URL", "https://ark.cn-beijing.volces.com/api/coding/v3"),
+        help="可选，仅 opencode 后端使用的 OpenAI-compatible base URL。",
+    )
+    parser.add_argument(
+        "--opencode-api-key",
+        type=str,
+        default=os.getenv("BID_REVIEW_OPENCODE_API_KEY") or os.getenv("OPENCODE_API_KEY"),
+        help="可选，仅 opencode 后端使用的 API Key（不建议写入脚本，优先环境变量）。",
     )
     parser.add_argument(
         "--effort",
@@ -57,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-progress",
         action="store_true",
-        help="关闭调用 Claude CLI 时的实时进度输出。",
+        help="关闭调用后端 CLI 时的实时进度输出。",
     )
     parser.add_argument(
         "--progress-level",
@@ -66,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["agent", "basic", "normal", "detailed", "events", "raw"],
         help="进度输出详细度：agent=阶段化进度(推荐)，basic=心跳/完成，normal=工具调用，detailed=完整中间片段，events=原始事件(过滤delta碎片)，raw=原始事件全量透传。",
     )
-    parser.add_argument("--timeout-sec", type=int, default=1800, help="单次 Claude 调用超时时间（秒）。")
+    parser.add_argument("--timeout-sec", type=int, default=1800, help="单次后端调用超时时间（秒）。")
     parser.add_argument(
         "--instruction",
         type=str,
@@ -77,13 +114,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--user-instruction",
         type=str,
         default="",
-        help="用户个人指令文本，或指向一个文本文件路径。会与系统提示词一起传给 Claude。",
+        help="用户个人指令文本，或指向一个文本文件路径。会与系统提示词一起传给所选后端。",
     )
     parser.add_argument(
         "--mcp-config",
         type=str,
         default=None,
-        help="可选，传给 claude --mcp-config 的配置文件或JSON字符串。",
+        help="可选，传给 claude --mcp-config 的配置文件或JSON字符串；opencode 后端也会尝试从中提取 MCP 服务器定义。",
     )
     parser.add_argument(
         "--no-raw-output",
@@ -106,8 +143,11 @@ def main() -> int:
             output_root=args.output_dir,
             tender_path=args.tender,
             bid_paths=args.bid,
+            backend=args.backend,
             claude_bin=args.claude_bin,
+            opencode_bin=args.opencode_bin,
             model=args.model,
+            opencode_model=args.opencode_model,
             effort=args.effort,
             show_progress=not args.no_progress,
             progress_level=args.progress_level,
@@ -115,6 +155,9 @@ def main() -> int:
             extra_instruction=instruction,
             user_instruction=user_instruction,
             mcp_config=args.mcp_config,
+            opencode_api_key=args.opencode_api_key,
+            opencode_api_url=args.opencode_api_url,
+            opencode_provider=args.opencode_provider,
             save_raw_output=not args.no_raw_output,
         )
     except Exception as exc:  # noqa: BLE001

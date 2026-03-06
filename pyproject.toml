@@ -16,7 +16,13 @@ dependencies = [
 dev = ["pytest>=8.0.0"]
 
 [tool.setuptools]
-packages = ["app"]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.setuptools.package-data]
+app = ["llm/prompts/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

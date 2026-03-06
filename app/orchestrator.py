@@ -8,13 +8,13 @@ import re
 import sys
 from typing import Any
 
-from app.llm import ClaudeClient
+from app.llm import create_llm_client
 from app.report import write_docx_report, write_json_report, write_markdown_report
 from app.report.to_json import write_raw_text
 from app.review import (
-    detect_roles_with_claude,
-    detect_tender_and_bids_with_claude,
-    run_bid_review_with_claude,
+    detect_roles,
+    detect_tender_and_bids,
+    run_bid_review,
 )
 
 
@@ -59,8 +59,11 @@ def run_pipeline(
     output_root: str | None,
     tender_path: str | None,
     bid_paths: list[str] | None,
+    backend: str = "claude",
     claude_bin: str | None,
+    opencode_bin: str | None = None,
     model: str | None,
+    opencode_model: str | None = None,
     effort: str,
     show_progress: bool,
     progress_level: str,
@@ -68,6 +71,9 @@ def run_pipeline(
     extra_instruction: str,
     user_instruction: str,
     mcp_config: str | None = None,
+    opencode_api_key: str | None = None,
+    opencode_api_url: str | None = None,
+    opencode_provider: str = "ark",
     save_raw_output: bool = True,
 ) -> BatchArtifacts:
     bid_paths = bid_paths or []
@@ -76,30 +82,44 @@ def run_pipeline(
 
     output_dir = _resolve_output_dir(output_root)
     workspace = str(Path.cwd())
-    client = ClaudeClient(
+    selected_backend, client = create_llm_client(
+        backend=backend,
         claude_bin=claude_bin,
+        opencode_bin=opencode_bin,
         model=model,
+        opencode_model=opencode_model,
         effort=effort,
         show_progress=show_progress,
         progress_level=progress_level,
         timeout_sec=timeout_sec,
         workspace=workspace,
         mcp_config=mcp_config,
+        opencode_api_key=opencode_api_key,
+        opencode_api_url=opencode_api_url,
+        opencode_provider=opencode_provider,
     )
     if not client.available():
-        raise RuntimeError("未检测到可用的 claude CLI，请先安装并登录。")
+        if selected_backend == "claude":
+            raise RuntimeError("未检测到可用的 claude CLI，请先安装并登录。")
+        raise RuntimeError(
+            "未检测到可用的 opencode CLI，请先安装并完成认证，或传入 --opencode-api-key/--opencode-api-url。"
+        )
 
     if tender_path and bid_paths:
         tender_abs = str(Path(tender_path).resolve())
         bids_abs = [str(Path(x).resolve()) for x in bid_paths]
         role_reasoning = "manual"
-        print("[pipeline] 使用手动指定的招投标角色。", file=sys.stderr, flush=True)
+        print(f"[pipeline] backend={selected_backend}，使用手动指定的招投标角色。", file=sys.stderr, flush=True)
     elif tender_path and inputs:
         tender_abs = str(Path(tender_path).resolve())
         bids_abs = [str(Path(x).resolve()) for x in inputs]
         bids_abs = [x for x in bids_abs if x != tender_abs]
         role_reasoning = "manual+tender"
-        print("[pipeline] 使用手动指定的招标文件，自动收集投标文件。", file=sys.stderr, flush=True)
+        print(
+            f"[pipeline] backend={selected_backend}，使用手动指定的招标文件，自动收集投标文件。",
+            file=sys.stderr,
+            flush=True,
+        )
     elif tender_path and not bid_paths:
         raise ValueError("已指定 --tender 时，请至少提供一个 --bid。")
     elif bid_paths and not tender_path:
@@ -107,12 +127,16 @@ def run_pipeline(
     else:
         if len(inputs) < 2:
             raise ValueError("自动识别模式下至少需要两个文件。")
-        print("[pipeline] 正在自动识别招标/投标文件角色...", file=sys.stderr, flush=True)
+        print(
+            f"[pipeline] backend={selected_backend}，正在自动识别招标/投标文件角色...",
+            file=sys.stderr,
+            flush=True,
+        )
         if len(inputs) == 2:
-            tender_abs, bid_abs, role_reasoning = detect_roles_with_claude(inputs, client)
+            tender_abs, bid_abs, role_reasoning = detect_roles(inputs, client)
             bids_abs = [bid_abs]
         else:
-            tender_abs, bids_abs, role_reasoning = detect_tender_and_bids_with_claude(inputs, client)
+            tender_abs, bids_abs, role_reasoning = detect_tender_and_bids(inputs, client)
         print(
             f"[pipeline] 角色识别完成：招标文件={Path(tender_abs).name}，投标文件数={len(bids_abs)}",
             file=sys.stderr,
@@ -138,7 +162,7 @@ def run_pipeline(
             file=sys.stderr,
             flush=True,
         )
-        report, raw = run_bid_review_with_claude(
+        report, raw = run_bid_review(
             tender_path=tender_abs,
             bid_path=bid_abs,
             client=client,
