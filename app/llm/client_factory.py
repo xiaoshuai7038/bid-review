@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Callable, Literal, Protocol, runtime_checkable
 
 from app.llm.claude_client import ClaudeClient
 from app.llm.opencode_client import OpenCodeClient
@@ -50,6 +50,7 @@ def create_llm_client(
     opencode_api_key: str | None,
     opencode_api_url: str | None,
     opencode_provider: str,
+    progress_callback: Callable[[str, str], None] | None = None,
 ) -> tuple[BackendName, LLMClient]:
     selected = normalize_backend(backend)
     if selected == "claude":
@@ -62,6 +63,7 @@ def create_llm_client(
             timeout_sec=timeout_sec,
             workspace=workspace,
             mcp_config=mcp_config,
+            progress_callback=progress_callback,
         )
 
     resolved_model = opencode_model or model or os.getenv("BID_REVIEW_OPENCODE_MODEL")
@@ -76,4 +78,5 @@ def create_llm_client(
         api_key=opencode_api_key,
         api_url=opencode_api_url,
         provider_id=opencode_provider,
+        progress_callback=progress_callback,
     )

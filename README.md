@@ -69,6 +69,32 @@ uv run python -m app.main ^
 .\run-review.ps1 -Input "C:\path\to\tender-document.pdf","C:\path\to\bid-document.docx" -OutputDir "data/output"
 ```
 
+## 桌面端 GUI
+
+项目现已提供 Windows 桌面 GUI MVP，复用现有 `run_pipeline` 与报告导出链路，不替换 CLI。
+
+开发态启动：
+
+```powershell
+uv run python -m app.gui.main
+```
+
+GUI 功能范围：
+
+- 选择 1 份招标文件 + 1..N 份投标文件
+- 配置 `claude / opencode`、模型、进度级别、输出目录、补充指令
+- 后台执行审查并查看进度时间线 / 运行日志
+- 查看 `summary / findings`
+- 直接打开 `review_report.json / review_report.md / review_report.docx / batch_summary.json`
+
+GUI 本地设置会保存在系统 AppData 目录，不写入仓库。
+
+如需做无头 smoke test 并截图：
+
+```powershell
+uv run python -m app.gui.main --smoke-test --screenshot "data/output/gui-smoke.png"
+```
+
 使用 OpenCode 后端（PowerShell）：
 
 ```powershell
@@ -226,6 +252,45 @@ uv run python -m app.main `
 ```
 
 批量模式下会在本次 `run-xxx` 目录下为每个投标文件生成一个子目录，并输出汇总文件 `batch_summary.json`。
+
+## 打包桌面 EXE
+
+桌面端采用 `PySide6`。
+
+默认提供一个更稳的 repo-local EXE：它会从仓库根目录自动定位 `.venv`，并启动 `pythonw -m app.gui.main`。
+这种方式不重打 Qt 运行时，适合当前项目开发和内网交付场景。
+
+执行：
+
+```powershell
+.\scripts\build-desktop.ps1
+```
+
+产物路径：
+
+```text
+dist\BidReviewDesktop\BidReviewDesktop.exe
+```
+
+如果需要先清理旧产物：
+
+```powershell
+.\scripts\build-desktop.ps1 -Clean
+```
+
+如需尝试自包含 standalone bundle，可显式指定：
+
+```powershell
+.\scripts\build-desktop.ps1 -Mode standalone
+```
+
+standalone 路径：
+
+```text
+dist\BidReviewDesktopStandalone\BidReviewDesktopStandalone.exe
+```
+
+当前 `standalone` 仍是实验性路径；默认推荐使用前面的 repo-local EXE。
 
 ## 环境要求
 

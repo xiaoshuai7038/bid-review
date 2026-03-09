@@ -11,10 +11,14 @@ requires-python = ">=3.10"
 dependencies = [
   "python-docx>=1.1.0",
   "pypdf>=5.0.0",
+  "PySide6>=6.8.1",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0.0"]
+dev = [
+  "pyinstaller>=6.16.0",
+  "pytest>=8.0.0",
+]
 
 [tool.setuptools]
 include-package-data = true
@@ -23,7 +27,7 @@ include-package-data = true
 include = ["app*"]
 
 [tool.setuptools.package-data]
-app = ["llm/prompts/*.md"]
+app = ["llm/prompts/*.md", "gui/assets/*.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

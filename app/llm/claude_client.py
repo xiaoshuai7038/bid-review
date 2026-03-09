@@ -12,7 +12,7 @@ from pathlib import Path
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from app.llm.prompt_store import render_prompt
 
@@ -99,6 +99,7 @@ class ClaudeClient:
     progress_level: str = "agent"  # agent|basic|normal|detailed|events|raw
     workspace: str | None = None
     mcp_config: str | None = None
+    progress_callback: Callable[[str, str], None] | None = None
     _last_tool_calls: list[str] = field(default_factory=list, init=False, repr=False)
     _last_tool_uses: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
 
@@ -161,6 +162,11 @@ class ClaudeClient:
                 return
         except ValueError:
             pass
+        if self.progress_callback is not None:
+            try:
+                self.progress_callback(message, level)
+            except Exception:
+                pass
         print(message, file=sys.stderr, flush=True)
 
     @staticmethod

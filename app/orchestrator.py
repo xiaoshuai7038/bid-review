@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import re
 import sys
-from typing import Any
+from typing import Any, Callable
 
 from app.llm import create_llm_client
 from app.report import write_docx_report, write_json_report, write_markdown_report
@@ -53,6 +53,20 @@ def _slugify(name: str) -> str:
     return text or "bid"
 
 
+def _emit_pipeline_message(
+    message: str,
+    *,
+    progress_callback: Callable[[str, str], None] | None = None,
+    level: str = "agent",
+) -> None:
+    if progress_callback is not None:
+        try:
+            progress_callback(message, level)
+        except Exception:
+            pass
+    print(message, file=sys.stderr, flush=True)
+
+
 def run_pipeline(
     *,
     inputs: list[str],
@@ -75,13 +89,15 @@ def run_pipeline(
     opencode_api_url: str | None = None,
     opencode_provider: str = "volcengine",
     save_raw_output: bool = True,
+    workspace: str | None = None,
+    progress_callback: Callable[[str, str], None] | None = None,
 ) -> BatchArtifacts:
     bid_paths = bid_paths or []
     if not inputs and not (tender_path and bid_paths):
         raise ValueError("至少提供 --input 文件列表，或显式指定 --tender 与一个或多个 --bid。")
 
     output_dir = _resolve_output_dir(output_root)
-    workspace = str(Path.cwd())
+    resolved_workspace = workspace or str(Path.cwd())
     selected_backend, client = create_llm_client(
         backend=backend,
         claude_bin=claude_bin,
@@ -92,11 +108,12 @@ def run_pipeline(
         show_progress=show_progress,
         progress_level=progress_level,
         timeout_sec=timeout_sec,
-        workspace=workspace,
+        workspace=resolved_workspace,
         mcp_config=mcp_config,
         opencode_api_key=opencode_api_key,
         opencode_api_url=opencode_api_url,
         opencode_provider=opencode_provider,
+        progress_callback=progress_callback,
     )
     if not client.available():
         if selected_backend == "claude":
@@ -109,16 +126,18 @@ def run_pipeline(
         tender_abs = str(Path(tender_path).resolve())
         bids_abs = [str(Path(x).resolve()) for x in bid_paths]
         role_reasoning = "manual"
-        print(f"[pipeline] backend={selected_backend}，使用手动指定的招投标角色。", file=sys.stderr, flush=True)
+        _emit_pipeline_message(
+            f"[pipeline] backend={selected_backend}，使用手动指定的招投标角色。",
+            progress_callback=progress_callback,
+        )
     elif tender_path and inputs:
         tender_abs = str(Path(tender_path).resolve())
         bids_abs = [str(Path(x).resolve()) for x in inputs]
         bids_abs = [x for x in bids_abs if x != tender_abs]
         role_reasoning = "manual+tender"
-        print(
+        _emit_pipeline_message(
             f"[pipeline] backend={selected_backend}，使用手动指定的招标文件，自动收集投标文件。",
-            file=sys.stderr,
-            flush=True,
+            progress_callback=progress_callback,
         )
     elif tender_path and not bid_paths:
         raise ValueError("已指定 --tender 时，请至少提供一个 --bid。")
@@ -127,20 +146,18 @@ def run_pipeline(
     else:
         if len(inputs) < 2:
             raise ValueError("自动识别模式下至少需要两个文件。")
-        print(
+        _emit_pipeline_message(
             f"[pipeline] backend={selected_backend}，正在自动识别招标/投标文件角色...",
-            file=sys.stderr,
-            flush=True,
+            progress_callback=progress_callback,
         )
         if len(inputs) == 2:
             tender_abs, bid_abs, role_reasoning = detect_roles(inputs, client)
             bids_abs = [bid_abs]
         else:
             tender_abs, bids_abs, role_reasoning = detect_tender_and_bids(inputs, client)
-        print(
+        _emit_pipeline_message(
             f"[pipeline] 角色识别完成：招标文件={Path(tender_abs).name}，投标文件数={len(bids_abs)}",
-            file=sys.stderr,
-            flush=True,
+            progress_callback=progress_callback,
         )
 
     bids_abs = list(dict.fromkeys(bids_abs))
@@ -157,10 +174,9 @@ def run_pipeline(
         else:
             run_subdir = output_dir
 
-        print(
+        _emit_pipeline_message(
             f"[pipeline] 开始审查 {idx}/{len(bids_abs)}: {Path(bid_abs).name}",
-            file=sys.stderr,
-            flush=True,
+            progress_callback=progress_callback,
         )
         report, raw = run_bid_review(
             tender_path=tender_abs,
@@ -188,10 +204,9 @@ def run_pipeline(
                 bid_path=bid_abs,
             )
         )
-        print(
+        _emit_pipeline_message(
             f"[pipeline] 完成审查 {idx}/{len(bids_abs)}: {Path(bid_abs).name}",
-            file=sys.stderr,
-            flush=True,
+            progress_callback=progress_callback,
         )
 
     summary_obj = {
