@@ -19,6 +19,15 @@
 - Wrapper script:
   - `.\run-review.ps1 -Input "<tender>","<bid>" -OutputDir "data/output"`
 
+## Recommended Workflow
+- Use `$feature-delivery-loop` for scoped feature work, refactors, migrations, or other long-horizon implementation tasks.
+- Use `$python-regression-fix-loop` for confirmed regressions that require minimal, compatibility-preserving fixes.
+- For long tasks, prefer a workspace-local task folder such as `tasks/<task-slug>/` with:
+  - `contract.md`: task-specific Success Contract and source of truth
+  - `plan.md`: milestone plan mapped to `Done When`
+  - `status.md`: current progress, validations, and blockers
+- Treat task-tracking files as working notes by default; do not commit them unless the user explicitly asks.
+
 ## Project Layout
 - `app/main.py`: CLI argument parsing and top-level execution.
 - `app/orchestrator.py`: role detection, batch orchestration, artifact generation.
@@ -36,16 +45,29 @@
   - report/orchestration code paths consuming those fields.
 - Do not commit generated artifacts (`data/output`, logs, temp files).
 
+## Repo Review Gates
+- Pause before changing CLI entry behavior or argument contracts in `app/main.py`.
+- Pause before changing prompt contracts, output fields, or report structure across:
+  - `app/llm/prompts/`
+  - `app/orchestrator.py`
+  - `app/report/`
+- Pause before changing Claude/OpenCode invocation behavior, retry flow, timeout handling, or tool-call guardrails in:
+  - `app/review/claude_review.py`
+  - related client code under `app/llm/`
+- Pause before adding a new production dependency, changing artifact filenames, or changing the expected contents of exported reports.
+
 ## Validation Checklist
 - Always run:
   - `uv run python -m app.main --help`
 - Run tests when available:
   - `uv run pytest -q`
+- If a task `contract.md` defines `Done When`, map each item to explicit validation before considering the task complete.
 - If report generation logic is changed, perform one local smoke run and verify:
   - `review_result.json`
   - `review_report.md`
   - `review_report.docx`
   - `batch_summary.json`
+- If backend compatibility is affected, validate the impacted Claude and/or OpenCode paths instead of assuming shared behavior.
 
 ## Debugging Notes
 - On failures, inspect run directory under `data/output/run-*`.
