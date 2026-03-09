@@ -6,10 +6,15 @@ import os
 import time
 import zipfile
 import xml.etree.ElementTree as ET
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from docx import Document
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 
 from app.llm.claude_client import (
     ClaudeCallError,
@@ -22,15 +27,18 @@ from app.llm.prompt_store import render_prompt
 
 _CONTEXT_REQUIREMENT_CATEGORY = "主体一致性"
 _CONTEXT_REQUIREMENT_TEXT = (
-    "投标文件中的关键主体名词（招标人/采购人/投标人/供应商/开户银行/账户名/账号/"
-    "统一社会信用代码/税号/法定代表人/授权代表）必须与所在位置和语义角色一致，"
-    "不得出现主体错位、字段串用或其他机构信息误填。"
+    "投标文件中的关键主体字段（招标人/采购人/投标人/供应商/开户银行/账户名/账号/"
+    "统一社会信用代码/税号/法定代表人/授权代表）必须先建立主体基线，并在全文范围内保持取值一致；"
+    "同时必须与所在位置和语义角色一致，不得出现主体错位、字段串用或其他机构信息误填。"
 )
-_CONTEXT_REQUIREMENT_SOURCE = "系统一致性校验规则（主体名词位置归属检查）"
+_CONTEXT_REQUIREMENT_SOURCE = "系统一致性校验规则（主体基线与位置归属检查）"
 _CONTEXT_REQUIREMENT_KEYWORDS = (
     "主体",
     "一致性",
+    "基线",
+    "全文",
     "错位",
+    "不一致",
     "招标人",
     "投标人",
     "采购人",
@@ -39,10 +47,15 @@ _CONTEXT_REQUIREMENT_KEYWORDS = (
     "账号",
     "统一社会信用代码",
     "税号",
+    "纳税人识别号",
 )
 _CONTEXT_FINDING_KEYWORDS = (
     "主体",
     "错位",
+    "不一致",
+    "冲突",
+    "基线",
+    "全文",
     "串用",
     "归属",
     "位置",
@@ -54,6 +67,7 @@ _CONTEXT_FINDING_KEYWORDS = (
     "账号",
     "统一社会信用代码",
     "税号",
+    "纳税人识别号",
     "法定代表人",
     "授权代表",
     "其他机构",
@@ -73,6 +87,51 @@ _IMAGE_SUFFIXES = {
     ".tif",
     ".tiff",
     ".gif",
+}
+
+_PRECISE_LOCATION_PATTERNS = (
+    re.compile(r"第\d+页\s*L\d+(?:-L\d+)?"),
+    re.compile(r"《[^》]+》\s*L\d+(?:-L\d+)?"),
+    re.compile(r"第[一二三四五六七八九十百0-9]+[章节][^：\n]{0,40}\s*L\d+(?:-L\d+)?"),
+    re.compile(r"(?:图片OCR|OCR(?:#\d+)?)\s*L\d+(?:-L\d+)?", flags=re.IGNORECASE),
+)
+
+_SPECIAL_SECTION_TITLES = {
+    "投标函",
+    "关于行贿等黑名单行为的专项承诺函",
+    "开标一览表",
+    "分项报价表",
+    "法定代表人、主要负责人身份证明",
+    "授权委托书",
+    "投标保证金交纳证明",
+    "基本账户开户许可证或者基本账户证明",
+    "资格审查申请书",
+    "商务条款偏离表",
+    "技术条款偏离表",
+    "项目实施团队人员配置",
+    "项目设计方案",
+    "供货及项目进度安排",
+    "售后服务方案",
+    "培训方案",
+}
+
+_LOCATION_STOPWORDS = {
+    "招标文件",
+    "投标文件",
+    "商务投标文件",
+    "经济投标文件",
+    "技术投标文件",
+    "显示",
+    "载明",
+    "写明",
+    "写为",
+    "记载",
+    "内容",
+    "关键原文",
+    "缺少定位信息",
+    "请补充章节",
+    "请补充页码",
+    "请补充段落",
 }
 
 
@@ -233,6 +292,15 @@ def _has_forbidden_write_tool_call(tool_uses: list[dict[str, Any]]) -> bool:
 
 def _strict_fail_on_forbidden_write() -> bool:
     return os.getenv("BID_REVIEW_FAIL_ON_FORBIDDEN_WRITE", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _local_semantic_guards_enabled() -> bool:
+    return os.getenv("BID_REVIEW_ENABLE_LOCAL_SEMANTIC_GUARDS", "0").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -442,7 +510,7 @@ def _clean_issue(value: Any) -> str:
     return text
 
 
-def _has_location_hint(text: str) -> bool:
+def _has_coarse_location_hint(text: str) -> bool:
     patterns = [
         r"第[一二三四五六七八九十百0-9]+章",
         r"第[一二三四五六七八九十百0-9]+节",
@@ -458,6 +526,433 @@ def _has_location_hint(text: str) -> bool:
         r"表[一二三四五六七八九十0-9]",
     ]
     return any(re.search(p, text) for p in patterns)
+
+
+def _has_precise_location_hint(text: str) -> bool:
+    return any(p.search(text or "") for p in _PRECISE_LOCATION_PATTERNS)
+
+
+def _has_location_hint(text: str) -> bool:
+    return _has_precise_location_hint(text)
+
+
+def _normalize_search_text(text: str) -> str:
+    return re.sub(r"[\s`'\"“”‘’:：;；,，。！？!?\-_/\\|（）()\[\]{}<>]+", "", str(text or "").lower())
+
+
+def _looks_like_section_heading(text: str) -> bool:
+    stripped = str(text or "").strip()
+    if not stripped or len(stripped) > 80:
+        return False
+    if stripped in _SPECIAL_SECTION_TITLES:
+        return True
+    if re.match(r"^第[一二三四五六七八九十百0-9]+章", stripped):
+        return True
+    if re.match(r"^第[一二三四五六七八九十百0-9]+节", stripped):
+        return True
+    if re.match(r"^[一二三四五六七八九十]+、", stripped):
+        return True
+    if re.match(r"^\d+(?:\.\d+){0,3}[\.、]?\s*", stripped):
+        return True
+    return False
+
+
+@lru_cache(maxsize=32)
+def _build_pdf_line_index(path_str: str) -> list[dict[str, Any]]:
+    path = Path(path_str)
+    if not path.exists() or path.suffix.lower() != ".pdf":
+        return []
+    try:
+        from pypdf import PdfReader
+    except Exception:  # noqa: BLE001
+        return []
+
+    out: list[dict[str, Any]] = []
+    try:
+        reader = PdfReader(str(path))
+    except Exception:  # noqa: BLE001
+        return []
+
+    for page_no, page in enumerate(reader.pages, start=1):
+        try:
+            page_text = page.extract_text() or ""
+        except Exception:  # noqa: BLE001
+            continue
+        lines = [_clean_text(x) for x in page_text.splitlines()]
+        lines = [x for x in lines if x]
+        for line_no, line_text in enumerate(lines, start=1):
+            out.append(
+                {
+                    "kind": "pdf",
+                    "page_no": page_no,
+                    "line_no": line_no,
+                    "section": "",
+                    "text": line_text,
+                    "norm": _normalize_search_text(line_text),
+                }
+            )
+    return out
+
+
+@lru_cache(maxsize=32)
+def _build_word_line_index(path_str: str) -> list[dict[str, Any]]:
+    path = Path(path_str)
+    if not path.exists() or path.suffix.lower() != ".docx":
+        return []
+
+    out: list[dict[str, Any]] = []
+    current_section = "文档开头"
+    section_line_no = 0
+
+    def _push_line(raw_text: str) -> None:
+        nonlocal current_section, section_line_no
+        line_text = _clean_text(raw_text)
+        if not line_text:
+            return
+        if _looks_like_section_heading(line_text):
+            current_section = line_text
+            section_line_no = 0
+        section_line_no += 1
+        out.append(
+            {
+                "kind": "word",
+                "page_no": 0,
+                "line_no": section_line_no,
+                "section": current_section,
+                "text": line_text,
+                "norm": _normalize_search_text(line_text),
+            }
+        )
+
+    try:
+        doc = Document(str(path))
+    except Exception:  # noqa: BLE001
+        return []
+
+    body = getattr(doc.element, "body", None)
+    if body is None:
+        return out
+
+    for child in body.iterchildren():
+        if isinstance(child, CT_P):
+            _push_line(Paragraph(child, doc).text)
+            continue
+        if not isinstance(child, CT_Tbl):
+            continue
+        table = Table(child, doc)
+        for row in table.rows:
+            row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+            _push_line(row_text)
+    return out
+
+
+def _extract_location_tokens(text: str) -> list[str]:
+    raw = str(text or "")
+    raw = re.sub(r"（缺少定位信息[^）]*）", "", raw)
+    raw = re.sub(r"第\d+页", " ", raw)
+    raw = re.sub(r"\bP\d+\b", " ", raw)
+    raw = re.sub(r"L\d+(?:-L?\d+)?", " ", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"第[一二三四五六七八九十百0-9]+[章节段]", " ", raw)
+    raw = raw.replace("图片OCR", " ").replace("OCR", " ")
+
+    candidates: list[str] = []
+    candidates.extend(re.findall(r"[“\"]([^”\"]{2,120})[”\"]", raw))
+    candidates.extend(re.split(r"[；;，,。:：\n|]+", raw))
+
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for cand in candidates:
+        cand_text = _clean_text(cand)
+        if not cand_text:
+            continue
+        pieces = [cand_text]
+        pieces.extend(re.findall(r"[\u4e00-\u9fffA-Za-z0-9（）()%\-]{2,80}", cand_text))
+        for piece in pieces:
+            token = _clean_text(piece)
+            token = re.sub(r"(显示|载明|写明|写为|为空白|空白|为空值|为空|缺失)$", "", token)
+            token = token.strip()
+            if len(token) < 2:
+                continue
+            if token in _LOCATION_STOPWORDS:
+                continue
+            key = _normalize_search_text(token)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            tokens.append(key)
+    return sorted(tokens, key=len, reverse=True)
+
+
+def _extract_section_mentions(text: str, known_sections: list[str]) -> list[str]:
+    out: list[str] = []
+    for section in known_sections:
+        if not section or section == "文档开头":
+            continue
+        if section in text and section not in out:
+            out.append(section)
+    return out
+
+
+def _extract_explicit_page_numbers(text: str) -> list[int]:
+    out: list[int] = []
+    for match in re.finditer(r"第(\d+)页", text or ""):
+        out.append(int(match.group(1)))
+    for match in re.finditer(r"\bP(\d+)\b", text or "", flags=re.IGNORECASE):
+        out.append(int(match.group(1)))
+    return sorted(set(out))
+
+
+def _resolve_precise_location_label(
+    evidence: str,
+    *,
+    line_index: list[dict[str, Any]],
+    doc_label: str,
+) -> str:
+    if not evidence or not line_index or _has_precise_location_hint(evidence):
+        return ""
+
+    tokens = _extract_location_tokens(evidence)
+    if not tokens:
+        return ""
+
+    known_sections = sorted({str(item.get("section", "")) for item in line_index if item.get("section")})
+    section_mentions = _extract_section_mentions(evidence, known_sections)
+    explicit_pages = _extract_explicit_page_numbers(evidence)
+
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for item in line_index:
+        score = 0
+        norm = str(item.get("norm", ""))
+        for token in tokens:
+            if token and token in norm:
+                score += len(token) * len(token)
+        if score <= 0:
+            continue
+        if section_mentions and str(item.get("section", "")) in section_mentions:
+            score += 200
+        if item["kind"] == "pdf" and explicit_pages:
+            if int(item["page_no"]) in explicit_pages:
+                score += 300
+            else:
+                continue
+        scored.append((score, item))
+
+    if not scored:
+        return ""
+
+    max_score = max(score for score, _ in scored)
+    cutoff = max(9, int(max_score * 0.6))
+    kept = [(score, item) for score, item in scored if score >= cutoff]
+
+    grouped: dict[tuple[str, str | int], dict[str, Any]] = {}
+    for score, item in kept:
+        if item["kind"] == "pdf":
+            key: tuple[str, str | int] = ("pdf", int(item["page_no"]))
+        else:
+            key = ("word", str(item.get("section", "")) or "文档开头")
+        bucket = grouped.setdefault(
+            key,
+            {
+                "score": 0,
+                "line_numbers": [],
+            },
+        )
+        bucket["score"] += score
+        bucket["line_numbers"].append(int(item["line_no"]))
+
+    best_groups = sorted(grouped.items(), key=lambda kv: kv[1]["score"], reverse=True)[:2]
+    labels: list[str] = []
+    for (kind, key), payload in best_groups:
+        line_numbers = sorted(set(payload["line_numbers"]))
+        start_line = line_numbers[0]
+        end_line = line_numbers[-1]
+        line_part = f"L{start_line}-L{end_line}"
+        if kind == "pdf":
+            labels.append(f"{doc_label}第{key}页 {line_part}")
+        else:
+            labels.append(f"{doc_label}《{key}》{line_part}")
+    return "；".join(labels)
+
+
+def _prepend_precise_location(evidence: str, location_label: str) -> str:
+    if not evidence or not location_label:
+        return evidence
+    if evidence.startswith(location_label):
+        return evidence
+    return f"{location_label}：{evidence}"
+
+
+def _enrich_report_evidence_locations(
+    report: dict[str, Any],
+    *,
+    tender_path: Path,
+    bid_path: Path,
+) -> dict[str, Any]:
+    findings = report.get("findings", [])
+    if not isinstance(findings, list):
+        return report
+
+    tender_index = _build_pdf_line_index(str(tender_path.resolve()))
+    bid_index: list[dict[str, Any]] = []
+    if bid_path.suffix.lower() == ".pdf":
+        bid_index = _build_pdf_line_index(str(bid_path.resolve()))
+    elif bid_path.suffix.lower() == ".docx":
+        bid_index = _build_word_line_index(str(bid_path.resolve()))
+
+    enriched: list[dict[str, Any]] = []
+    for item in findings:
+        if not isinstance(item, dict):
+            continue
+        current = dict(item)
+        tender_evidence = str(current.get("tender_evidence", "") or "")
+        bid_evidence = str(current.get("bid_evidence", "") or "")
+        if tender_evidence and not _has_precise_location_hint(tender_evidence):
+            label = _resolve_precise_location_label(
+                tender_evidence,
+                line_index=tender_index,
+                doc_label="招标文件",
+            )
+            current["tender_evidence"] = _prepend_precise_location(tender_evidence, label)
+        if bid_evidence and not _has_precise_location_hint(bid_evidence):
+            label = _resolve_precise_location_label(
+                bid_evidence,
+                line_index=bid_index,
+                doc_label="投标文件",
+            )
+            current["bid_evidence"] = _prepend_precise_location(bid_evidence, label)
+        enriched.append(current)
+
+    report["findings"] = enriched
+    return report
+
+
+def _find_precise_location_gaps(
+    report: dict[str, Any],
+    *,
+    bid_path: Path,
+) -> list[str]:
+    findings = report.get("findings", [])
+    if not isinstance(findings, list):
+        return []
+
+    gaps: list[str] = []
+    for idx, item in enumerate(findings, start=1):
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status", "")).strip()
+        if status not in {"non_compliant", "risk", "needs_manual"}:
+            continue
+        issue = _clean_text(str(item.get("issue", "") or ""))[:70]
+        finding_id = str(item.get("id", "") or f"F{idx:03d}")
+        tender_evidence = str(item.get("tender_evidence", "") or "")
+        bid_evidence = str(item.get("bid_evidence", "") or "")
+        if not _has_precise_location_hint(tender_evidence):
+            gaps.append(f"{finding_id} 的 tender_evidence 缺少精确定位：{issue}")
+        if not _has_precise_location_hint(bid_evidence):
+            expected = "章节/小节 + Lm-Ln"
+            if bid_path.suffix.lower() == ".pdf":
+                expected = "第X页 Lm-Ln"
+            gaps.append(f"{finding_id} 的 bid_evidence 缺少精确定位（需要 {expected}）：{issue}")
+    return gaps
+
+
+def _append_precise_location_enforcement(
+    prompt: str,
+    *,
+    bid_path: Path,
+    gaps: list[str],
+) -> str:
+    bid_format = "投标文件第X页 Lm-Ln：关键原文"
+    if bid_path.suffix.lower() == ".docx":
+        bid_format = "投标文件《章节名》Lm-Ln：关键原文"
+    gap_block = "\n".join(f"- {g}" for g in gaps[:8])
+    enforce = f"""
+
+[证据精确定位强制要求]
+你上一次返回的部分 evidence 仍然只有粗粒度定位。请重新读取原始文档，并严格按以下格式输出：
+- 招标文件 PDF 证据：`招标文件第X页 Lm-Ln：关键原文`
+- 投标文件证据：`{bid_format}`
+- OCR 图片证据：`投标文件第X页图片OCR Lm-Ln：关键原文`；若无法确定页码，则写 `投标文件《章节名》图片OCR Lm-Ln：关键原文`
+
+行号编号规则：
+- `read_pdf` 的每个 `第X页:` 块内，按换行从上到下编号为 `L1, L2, ...`
+- `read_word` 的每个章节/小节/模板标题块内，按换行编号为 `L1, L2, ...`
+- OCR 文本按每个图片或每页 OCR 的换行编号为 `L1, L2, ...`
+
+禁止继续使用以下粗粒度格式：
+- `P15`
+- `第3页`
+- `资格审查申请书P3`
+- `第六章`
+- `缺少定位信息`
+
+以下 finding 上一次仍缺少精确定位，请重点修正：
+{gap_block}
+"""
+    return prompt + enforce
+
+
+def _collect_review_guard_state(
+    *,
+    tool_calls: list[str],
+    tool_uses: list[dict[str, Any]],
+    ocr_required: bool,
+    require_word_extract: bool,
+    bid_path: Path,
+) -> dict[str, Any]:
+    has_ocr = _has_ocr_tool_call(tool_calls)
+    has_word_extract = _has_word_image_extract_call(tool_calls) if require_word_extract else True
+    has_word_batch_ocr = _has_word_batch_ocr_call(tool_calls) if require_word_extract else True
+    word_ocr_coverage_ok = True
+    word_ocr_coverage_detail = ""
+    if ocr_required and require_word_extract and has_word_extract and has_word_batch_ocr:
+        word_ocr_coverage_ok, word_ocr_coverage_detail = _validate_docx_ocr_coverage(
+            tool_uses,
+            bid_path=bid_path,
+        )
+    has_forbidden_write = _has_forbidden_write_tool_call(tool_uses)
+    missing_requirements: list[str] = []
+    if ocr_required and not has_ocr:
+        missing_requirements.append("OCR工具调用")
+    if ocr_required and require_word_extract and not has_word_extract:
+        missing_requirements.append("Word图片提取调用")
+    if ocr_required and require_word_extract and not has_word_batch_ocr:
+        missing_requirements.append("全量图片批量OCR调用")
+    ocr_guard_ok = not ocr_required or (
+        not missing_requirements and (not require_word_extract or word_ocr_coverage_ok)
+    )
+    return {
+        "has_ocr": has_ocr,
+        "has_word_extract": has_word_extract,
+        "has_word_batch_ocr": has_word_batch_ocr,
+        "word_ocr_coverage_ok": word_ocr_coverage_ok,
+        "word_ocr_coverage_detail": word_ocr_coverage_detail,
+        "has_forbidden_write": has_forbidden_write,
+        "missing_requirements": missing_requirements,
+        "ocr_guard_ok": ocr_guard_ok,
+    }
+
+
+def _describe_review_guard_failures(
+    state: dict[str, Any],
+    *,
+    ocr_required: bool,
+    require_word_extract: bool,
+) -> list[str]:
+    parts: list[str] = []
+    missing_requirements = [str(x) for x in state.get("missing_requirements", [])]
+    if ocr_required and missing_requirements:
+        parts.append(f"缺少必要MCP调用（{', '.join(missing_requirements)}）")
+    if (
+        ocr_required
+        and require_word_extract
+        and not bool(state.get("word_ocr_coverage_ok", True))
+        and str(state.get("word_ocr_coverage_detail", "")).strip()
+    ):
+        parts.append(str(state.get("word_ocr_coverage_detail", "")).strip())
+    if bool(state.get("has_forbidden_write", False)):
+        parts.append("检测到写文件/脚本执行行为")
+    return parts
 
 
 def _clean_recommendation(value: Any) -> str:
@@ -495,15 +990,10 @@ def _normalize_findings(raw: Any) -> list[dict[str, Any]]:
         bid_evidence = re.sub(r"(?i)\bocr\b", "截图文字内容核对", bid_evidence)
         recommendation = _clean_recommendation(item.get("recommendation") or "")
 
-        # 投标证据强制要求可定位信息，缺失时补充提示语。
-        if bid_evidence and not _has_location_hint(bid_evidence):
-            bid_evidence = f"{bid_evidence}（缺少定位信息：请补充章节/页码/段落）"
+        if not bid_evidence:
+            bid_evidence = "未提供投标证据"
             if not recommendation:
-                recommendation = "请补充可定位的投标证据（章节/页码/段落）后再核对。"
-        elif not bid_evidence:
-            bid_evidence = "未提供投标证据（请补充章节/页码/段落）"
-            if not recommendation:
-                recommendation = "请补充可定位的投标证据（章节/页码/段落）后再核对。"
+                recommendation = "请补充可定位的投标证据后再核对。"
 
         out.append(
             {
@@ -796,6 +1286,91 @@ def _refresh_summary(report: dict[str, Any]) -> None:
     summary["needs_manual_count"] = sum(1 for f in findings if str(f.get("status", "")) == "needs_manual")
     summary["finding_count"] = len(findings)
     summary["requirement_count"] = len(requirements)
+
+
+def _finding_merge_key(finding: dict[str, Any]) -> str:
+    requirement_id = str(finding.get("requirement_id", "") or "").strip()
+    issue = _compact_token_text(finding.get("issue", ""))
+    if not issue:
+        return ""
+    return f"{requirement_id}|{issue}"
+
+
+def _location_precision_score(text: str) -> int:
+    value = str(text or "").strip()
+    if not value:
+        return 0
+    score = 0
+    if _has_precise_location_hint(value):
+        score += 100
+    elif _has_coarse_location_hint(value):
+        score += 10
+    score += len(re.findall(r"L\d+(?:-L\d+)?", value, flags=re.IGNORECASE)) * 5
+    if "图片OCR" in value:
+        score += 3
+    if "缺少定位信息" in value:
+        score -= 50
+    return score
+
+
+def _pick_better_location_evidence(current_text: str, candidate_text: str) -> str:
+    current = str(current_text or "")
+    candidate = str(candidate_text or "")
+    if not candidate.strip():
+        return current
+    if not current.strip():
+        return candidate
+    if _location_precision_score(candidate) > _location_precision_score(current):
+        return candidate
+    return current
+
+
+def _merge_precise_location_retry_report(
+    report: dict[str, Any],
+    retry_report: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    findings = report.get("findings", [])
+    retry_findings = retry_report.get("findings", [])
+    if not isinstance(findings, list) or not isinstance(retry_findings, list):
+        return report, False
+
+    retry_by_key = {
+        key: item
+        for item in retry_findings
+        if isinstance(item, dict) and (key := _finding_merge_key(item))
+    }
+
+    changed = False
+    merged_findings: list[dict[str, Any]] = []
+    for item in findings:
+        if not isinstance(item, dict):
+            continue
+        current = dict(item)
+        retry_item = retry_by_key.get(_finding_merge_key(current))
+        if isinstance(retry_item, dict):
+            better_tender = _pick_better_location_evidence(
+                str(current.get("tender_evidence", "") or ""),
+                str(retry_item.get("tender_evidence", "") or ""),
+            )
+            better_bid = _pick_better_location_evidence(
+                str(current.get("bid_evidence", "") or ""),
+                str(retry_item.get("bid_evidence", "") or ""),
+            )
+            if better_tender != str(current.get("tender_evidence", "") or ""):
+                current["tender_evidence"] = better_tender
+                changed = True
+            if better_bid != str(current.get("bid_evidence", "") or ""):
+                current["bid_evidence"] = better_bid
+                changed = True
+        merged_findings.append(current)
+
+    if not changed:
+        return report, False
+
+    merged_report = dict(report)
+    merged_report["findings"] = _dedupe_findings(merged_findings)
+    _refresh_summary(merged_report)
+    return merged_report, True
 
 
 def _extract_year_after_anchor(compact_text: str, anchor: str, window: int) -> str:
@@ -1413,6 +1988,10 @@ def _apply_stability_guards(
     bid_path: Path,
     force_manual_image_checks: bool = False,
 ) -> dict[str, Any]:
+    report["findings"] = _dedupe_findings(report.get("findings", []))
+    _refresh_summary(report)
+    if not _local_semantic_guards_enabled():
+        return report
     if bid_path.suffix.lower() != ".docx":
         return report
     text = _extract_docx_text(bid_path)
@@ -1423,6 +2002,51 @@ def _apply_stability_guards(
         text,
         force_manual_image_checks=force_manual_image_checks,
     )
+
+
+def _parse_review_report_from_raw(
+    *,
+    raw_output: str,
+    prompt: str,
+    client: Any,
+    backend_name: str,
+    tender_path: Path,
+    bid_path: Path,
+) -> tuple[dict[str, Any], str]:
+    try:
+        data = extract_json_payload(raw_output)
+    except Exception:  # noqa: BLE001
+        data = client.ask_json(
+            prompt,
+            required_top_keys=["requirements", "findings", "summary"],
+            task_label=f"初审(JSON重试)：{bid_path.name}",
+        )
+        raw_output = (
+            f"{raw_output}\n\n[JSON_FALLBACK]\n"
+            + json.dumps(data, ensure_ascii=False, indent=2)
+        )
+    if not isinstance(data, dict):
+        raise ValueError(f"{backend_name} 返回的审查结果不是 JSON 对象。")
+    for key in ("requirements", "findings", "summary"):
+        if key not in data:
+            raise ValueError(f"{backend_name} 返回缺少关键字段: {key}")
+
+    report = normalize_review_report(data)
+    report = _ensure_context_consistency_requirement(report)
+    valid_req_ids = {str(r.get("id", "")) for r in report.get("requirements", [])}
+    context_req_id = _find_context_requirement_id(report.get("requirements", []))
+    report["findings"] = _bind_findings_to_context_requirement(
+        report.get("findings", []),
+        valid_req_ids=valid_req_ids,
+        context_req_id=context_req_id,
+    )
+    report = _enrich_report_evidence_locations(
+        report,
+        tender_path=tender_path,
+        bid_path=bid_path,
+    )
+    _refresh_summary(report)
+    return report, raw_output
 
 
 def detect_roles_with_claude(paths: list[str], client: Any) -> tuple[str, str, str]:
@@ -1547,112 +2171,114 @@ def run_bid_review_with_claude(
     try:
         prompt = _append_no_write_enforcement(prompt)
         raw_output = client.ask_text(prompt, task_label=f"初审：{bid_path_obj.name}")
-        first_calls = client.get_last_tool_calls()
-        first_uses = client.get_last_tool_uses()
-        has_ocr = _has_ocr_tool_call(first_calls)
-        has_word_extract = _has_word_image_extract_call(first_calls) if require_word_extract else True
-        has_word_batch_ocr = _has_word_batch_ocr_call(first_calls) if require_word_extract else True
-        word_ocr_coverage_ok = True
-        word_ocr_coverage_detail = ""
-        if ocr_required and require_word_extract and has_word_extract and has_word_batch_ocr:
-            word_ocr_coverage_ok, word_ocr_coverage_detail = _validate_docx_ocr_coverage(
-                first_uses,
-                bid_path=bid_path_obj,
-            )
-        has_forbidden_write = _has_forbidden_write_tool_call(first_uses)
-        need_retry = has_forbidden_write or (
-            ocr_required and (not has_ocr or not has_word_extract or not has_word_batch_ocr or not word_ocr_coverage_ok)
+        first_guard = _collect_review_guard_state(
+            tool_calls=client.get_last_tool_calls(),
+            tool_uses=client.get_last_tool_uses(),
+            ocr_required=ocr_required,
+            require_word_extract=require_word_extract,
+            bid_path=bid_path_obj,
         )
+        need_retry = bool(first_guard.get("has_forbidden_write", False)) or not bool(first_guard.get("ocr_guard_ok", True))
         if need_retry:
             retry_prompt = prompt
-            if ocr_required and (
-                not has_ocr or not has_word_extract or not has_word_batch_ocr or not word_ocr_coverage_ok
-            ):
+            if not bool(first_guard.get("ocr_guard_ok", True)):
                 retry_prompt = _append_ocr_enforcement(retry_prompt, require_word_extract=require_word_extract)
-            if require_word_extract and not word_ocr_coverage_ok and word_ocr_coverage_detail:
+            if require_word_extract and not bool(first_guard.get("word_ocr_coverage_ok", True)):
                 retry_prompt = (
                     retry_prompt
                     + "\n你上一次未完成 Word 提图全量 OCR。"
-                    + word_ocr_coverage_detail
+                    + str(first_guard.get("word_ocr_coverage_detail", ""))
                     + "请严格覆盖提图目录中的全部图片。"
                 )
-            if has_forbidden_write:
+            if bool(first_guard.get("has_forbidden_write", False)):
                 retry_prompt = _append_no_write_enforcement(retry_prompt)
             retry_output = client.ask_text(retry_prompt, task_label=f"初审重试(约束强制)：{bid_path_obj.name}")
-            retry_calls = client.get_last_tool_calls()
-            retry_uses = client.get_last_tool_uses()
-            has_ocr = _has_ocr_tool_call(retry_calls)
-            has_word_extract = _has_word_image_extract_call(retry_calls) if require_word_extract else True
-            has_word_batch_ocr = _has_word_batch_ocr_call(retry_calls) if require_word_extract else True
-            word_ocr_coverage_ok = True
-            word_ocr_coverage_detail = ""
-            if ocr_required and require_word_extract and has_word_extract and has_word_batch_ocr:
-                word_ocr_coverage_ok, word_ocr_coverage_detail = _validate_docx_ocr_coverage(
-                    retry_uses,
-                    bid_path=bid_path_obj,
-                )
-            has_forbidden_write = _has_forbidden_write_tool_call(retry_uses)
-            if not has_ocr or not has_word_extract or not has_word_batch_ocr:
-                need = []
-                if not has_ocr:
-                    need.append("OCR工具调用")
-                if not has_word_extract:
-                    need.append("Word图片提取调用")
-                if not has_word_batch_ocr:
-                    need.append("全量图片批量OCR调用")
+            retry_guard = _collect_review_guard_state(
+                tool_calls=client.get_last_tool_calls(),
+                tool_uses=client.get_last_tool_uses(),
+                ocr_required=ocr_required,
+                require_word_extract=require_word_extract,
+                bid_path=bid_path_obj,
+            )
+            missing_requirements = [str(x) for x in retry_guard.get("missing_requirements", [])]
+            if missing_requirements:
                 raise ClaudeCallError(
-                    f"审查阶段缺少必要MCP调用（{', '.join(need)}），已按强制规则重试1次仍失败。"
+                    f"审查阶段缺少必要MCP调用（{', '.join(missing_requirements)}），已按强制规则重试1次仍失败。"
                 )
-            if require_word_extract and not word_ocr_coverage_ok:
+            if require_word_extract and not bool(retry_guard.get("word_ocr_coverage_ok", True)):
                 raise ClaudeCallError(
-                    f"Word图片OCR未全量覆盖，已按强制规则重试1次仍失败。{word_ocr_coverage_detail}"
+                    "Word图片OCR未全量覆盖，已按强制规则重试1次仍失败。"
+                    + str(retry_guard.get("word_ocr_coverage_detail", ""))
                 )
-            if has_forbidden_write and _strict_fail_on_forbidden_write():
+            if bool(retry_guard.get("has_forbidden_write", False)) and _strict_fail_on_forbidden_write():
                 raise ClaudeCallError("审查阶段检测到写文件/脚本执行行为，已按只读规则重试1次仍失败。")
             raw_output = retry_output
-        elif ocr_required and require_word_extract and not word_ocr_coverage_ok:
+            active_guard = retry_guard
+        else:
+            active_guard = first_guard
+        if require_word_extract and not bool(active_guard.get("word_ocr_coverage_ok", True)):
             raise ClaudeCallError(
-                f"Word图片OCR未全量覆盖。{word_ocr_coverage_detail}"
+                "Word图片OCR未全量覆盖。"
+                + str(active_guard.get("word_ocr_coverage_detail", ""))
             )
         if ocr_required and require_word_extract:
-            word_ocr_fully_covered = word_ocr_coverage_ok
+            word_ocr_fully_covered = bool(active_guard.get("word_ocr_coverage_ok", True))
+        report, raw_output = _parse_review_report_from_raw(
+            raw_output=raw_output,
+            prompt=prompt,
+            client=client,
+            backend_name=backend_name,
+            tender_path=tender_path_obj,
+            bid_path=bid_path_obj,
+        )
+        location_gaps = _find_precise_location_gaps(report, bid_path=bid_path_obj)
+        if location_gaps:
+            location_retry_prompt = _append_precise_location_enforcement(
+                prompt,
+                bid_path=bid_path_obj,
+                gaps=location_gaps,
+            )
+            location_retry_raw = client.ask_text(
+                location_retry_prompt,
+                task_label=f"初审重试(精确定位)：{bid_path_obj.name}",
+            )
+            retry_report, location_retry_raw = _parse_review_report_from_raw(
+                raw_output=location_retry_raw,
+                prompt=location_retry_prompt,
+                client=client,
+                backend_name=backend_name,
+                tender_path=tender_path_obj,
+                bid_path=bid_path_obj,
+            )
+            location_retry_guard = _collect_review_guard_state(
+                tool_calls=client.get_last_tool_calls(),
+                tool_uses=client.get_last_tool_uses(),
+                ocr_required=ocr_required,
+                require_word_extract=require_word_extract,
+                bid_path=bid_path_obj,
+            )
+            location_retry_failures = _describe_review_guard_failures(
+                location_retry_guard,
+                ocr_required=ocr_required,
+                require_word_extract=require_word_extract,
+            )
+            if bool(location_retry_guard.get("has_forbidden_write", False)) and _strict_fail_on_forbidden_write():
+                raise ClaudeCallError("精确定位重试阶段检测到写文件/脚本执行行为，已按只读规则跳过采纳。")
+            if location_retry_failures:
+                raw_output = (
+                    f"{raw_output}\n\n[LOCATION_RETRY_SKIPPED]\n"
+                    + "；".join(location_retry_failures)
+                    + f"\n{location_retry_raw}"
+                )
+            else:
+                merged_report, merged = _merge_precise_location_retry_report(report, retry_report)
+                if merged:
+                    report = merged_report
+                    raw_output = f"{raw_output}\n\n[LOCATION_RETRY]\n{location_retry_raw}"
+                else:
+                    raw_output = f"{raw_output}\n\n[LOCATION_RETRY_SKIPPED]\n{location_retry_raw}"
     finally:
         client.timeout_sec = original_timeout
-    try:
-        data = extract_json_payload(raw_output)
-    except Exception:  # noqa: BLE001
-        # 二次重试：走严格 JSON API 通道。
-        data = client.ask_json(
-            prompt,
-            required_top_keys=["requirements", "findings", "summary"],
-            task_label=f"初审(JSON重试)：{bid_path_obj.name}",
-        )
-        raw_output = (
-            f"{raw_output}\n\n[JSON_FALLBACK]\n"
-            + json.dumps(data, ensure_ascii=False, indent=2)
-        )
-    if not isinstance(data, dict):
-        raise ValueError(f"{backend_name} 返回的审查结果不是 JSON 对象。")
-    for key in ("requirements", "findings", "summary"):
-        if key not in data:
-            raise ValueError(f"{backend_name} 返回缺少关键字段: {key}")
-    report = normalize_review_report(data)
-    report = _ensure_context_consistency_requirement(report)
-    valid_req_ids = {str(r.get("id", "")) for r in report.get("requirements", [])}
-    context_req_id = _find_context_requirement_id(report.get("requirements", []))
-    report["findings"] = _bind_findings_to_context_requirement(
-        report.get("findings", []),
-        valid_req_ids=valid_req_ids,
-        context_req_id=context_req_id,
-    )
-    report["summary"]["non_compliant_count"] = sum(
-        1 for f in report["findings"] if f["status"] == "non_compliant"
-    )
-    report["summary"]["risk_count"] = sum(1 for f in report["findings"] if f["status"] == "risk")
-    report["summary"]["needs_manual_count"] = sum(
-        1 for f in report["findings"] if f["status"] == "needs_manual"
-    )
-    report["summary"]["finding_count"] = len(report["findings"])
 
     enable_second_pass = os.getenv("BID_REVIEW_ENABLE_SECOND_PASS", "0").strip().lower() in {
         "1",
@@ -1705,6 +2331,12 @@ def run_bid_review_with_claude(
             context_req_id=context_req_id,
         )
         add_findings = [f for f in add_findings if str(f.get("requirement_id", "")) in valid_req_ids]
+        temp_report = _enrich_report_evidence_locations(
+            {"findings": add_findings},
+            tender_path=tender_path_obj,
+            bid_path=bid_path_obj,
+        )
+        add_findings = temp_report.get("findings", add_findings)
     if add_findings:
         report["findings"] = _dedupe_findings(report["findings"] + add_findings)
         report["summary"]["non_compliant_count"] = sum(

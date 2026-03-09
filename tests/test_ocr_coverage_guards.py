@@ -37,11 +37,13 @@ class _FakeClient:
         self._last_tool_calls: list[str] = []
         self.ask_text_calls = 0
         self.prompts: list[str] = []
+        self.timeout_history: list[int] = []
 
     def ask_text(self, prompt: str, *, task_label: str | None = None) -> str:
         idx = self.ask_text_calls
         self.ask_text_calls += 1
         self.prompts.append(prompt)
+        self.timeout_history.append(self.timeout_sec)
         self._last_tool_uses = self._tool_uses_seq[min(idx, len(self._tool_uses_seq) - 1)]
         self._last_tool_calls = [str(x.get("name", "")) for x in self._last_tool_uses]
         return self._outputs[min(idx, len(self._outputs) - 1)]
@@ -268,6 +270,146 @@ def test_run_bid_review_second_pass_prompt_uses_absolute_paths(
     second_prompt = client.prompts[1]
     assert f"- 招标文件: {tender_path.resolve()}" in second_prompt
     assert f"- 投标文件: {bid_path.resolve()}" in second_prompt
+
+
+def test_location_retry_revalidates_docx_ocr_and_keeps_extended_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("BID_REVIEW_DOCX_OCR_REQUIRED", "1")
+    monkeypatch.setenv("BID_REVIEW_ENABLE_SECOND_PASS", "0")
+
+    bid_path = tmp_path / "bid.docx"
+    bid_path.write_bytes(b"placeholder")
+
+    extract_dir = tmp_path / "extract-c"
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    (extract_dir / "1.png").write_bytes(b"a")
+    (extract_dir / "2.png").write_bytes(b"b")
+
+    coarse_output = json.dumps(
+        {
+            "requirements": [{"id": "R001", "category": "响应格式", "text": "t", "source": "s"}],
+            "findings": [
+                {
+                    "id": "F001",
+                    "requirement_id": "R001",
+                    "status": "non_compliant",
+                    "issue": "申请人填写错误",
+                    "tender_evidence": "招标文件第1页 L1-L2：资格审查申请书应由投标人填写",
+                    "bid_evidence": "投标文件主体信息错误",
+                    "recommendation": "更正申请人名称",
+                }
+            ],
+            "summary": {"requirement_count": 1, "finding_count": 1},
+        },
+        ensure_ascii=False,
+    )
+    precise_output = json.dumps(
+        {
+            "requirements": [{"id": "R001", "category": "响应格式", "text": "t", "source": "s"}],
+            "findings": [
+                {
+                    "id": "F001",
+                    "requirement_id": "R001",
+                    "status": "non_compliant",
+                    "issue": "申请人填写错误",
+                    "tender_evidence": "招标文件第1页 L1-L2：资格审查申请书应由投标人填写",
+                    "bid_evidence": "投标文件《资格审查申请书》L2-L2：申请人：测试科技有限公司",
+                    "recommendation": "更正申请人名称",
+                }
+            ],
+            "summary": {"requirement_count": 1, "finding_count": 1},
+        },
+        ensure_ascii=False,
+    )
+
+    valid_uses = _mk_tool_uses(extract_dir, ocr_dir=extract_dir)
+    invalid_retry_uses = [{"name": "Read", "input": {"path": "x"}}]
+    client = _FakeClient(
+        outputs=[coarse_output, precise_output],
+        tool_uses_seq=[valid_uses, invalid_retry_uses],
+    )
+
+    report, raw = run_bid_review_with_claude(
+        tender_path=str(tmp_path / "tender.pdf"),
+        bid_path=str(bid_path),
+        client=client,
+        extra_instruction="",
+        user_instruction="",
+    )
+
+    assert client.ask_text_calls == 2
+    assert client.timeout_history == [7200, 7200]
+    assert report["findings"][0]["bid_evidence"] == "投标文件主体信息错误"
+    assert "[LOCATION_RETRY_SKIPPED]" in raw
+    assert "缺少必要MCP调用" in raw
+
+
+def test_location_retry_forbidden_write_respects_strict_fail_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("BID_REVIEW_ENABLE_SECOND_PASS", "0")
+    monkeypatch.setenv("BID_REVIEW_DOCX_OCR_REQUIRED", "0")
+    monkeypatch.setenv("BID_REVIEW_FAIL_ON_FORBIDDEN_WRITE", "1")
+
+    bid_path = tmp_path / "bid.docx"
+    bid_path.write_bytes(b"placeholder")
+
+    coarse_output = json.dumps(
+        {
+            "requirements": [{"id": "R001", "category": "响应格式", "text": "t", "source": "s"}],
+            "findings": [
+                {
+                    "id": "F001",
+                    "requirement_id": "R001",
+                    "status": "non_compliant",
+                    "issue": "申请人填写错误",
+                    "tender_evidence": "招标文件第1页 L1-L2：资格审查申请书应由投标人填写",
+                    "bid_evidence": "投标文件主体信息错误",
+                    "recommendation": "更正申请人名称",
+                }
+            ],
+            "summary": {"requirement_count": 1, "finding_count": 1},
+        },
+        ensure_ascii=False,
+    )
+    precise_output = json.dumps(
+        {
+            "requirements": [{"id": "R001", "category": "响应格式", "text": "t", "source": "s"}],
+            "findings": [
+                {
+                    "id": "F001",
+                    "requirement_id": "R001",
+                    "status": "non_compliant",
+                    "issue": "申请人填写错误",
+                    "tender_evidence": "招标文件第1页 L1-L2：资格审查申请书应由投标人填写",
+                    "bid_evidence": "投标文件《资格审查申请书》L2-L2：申请人：测试科技有限公司",
+                    "recommendation": "更正申请人名称",
+                }
+            ],
+            "summary": {"requirement_count": 1, "finding_count": 1},
+        },
+        ensure_ascii=False,
+    )
+
+    client = _FakeClient(
+        outputs=[coarse_output, precise_output],
+        tool_uses_seq=[
+            [{"name": "Read", "input": {"path": "x"}}],
+            [{"name": "Write", "input": {"file_path": "x"}}],
+        ],
+    )
+
+    with pytest.raises(ClaudeCallError, match="精确定位重试阶段检测到写文件/脚本执行行为"):
+        run_bid_review_with_claude(
+            tender_path=str(tmp_path / "tender.pdf"),
+            bid_path=str(bid_path),
+            client=client,
+            extra_instruction="",
+            user_instruction="",
+        )
 
 
 def test_stability_guards_keep_known_subject_mismatch_pattern() -> None:
