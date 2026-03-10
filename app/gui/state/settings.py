@@ -49,7 +49,10 @@ def _settings_path() -> Path:
 class DesktopSettings:
     default_backend: str = "claude"
     default_output_dir: str = field(default_factory=_default_output_dir)
-    default_model: str = field(default_factory=lambda: os.getenv("ANTHROPIC_MODEL", ""))
+    # Legacy shared model field kept for backward compatibility with older settings files.
+    default_model: str = ""
+    claude_default_model: str = field(default_factory=lambda: os.getenv("ANTHROPIC_MODEL", ""))
+    opencode_default_model: str = field(default_factory=lambda: os.getenv("BID_REVIEW_OPENCODE_MODEL", ""))
     default_progress_level: str = "agent"
     default_timeout_sec: int = 1800
     default_effort: str = "low"
@@ -67,7 +70,17 @@ class DesktopSettings:
     def from_dict(cls, data: dict[str, Any]) -> "DesktopSettings":
         known = {field.name for field in cls.__dataclass_fields__.values()}
         payload = {k: v for k, v in data.items() if k in known}
+        legacy_model = str(data.get("default_model", "") or "").strip()
+        if legacy_model:
+            payload.setdefault("claude_default_model", legacy_model)
+            payload.setdefault("opencode_default_model", legacy_model)
         return cls(**payload)
+
+    def model_for_backend(self, backend: str) -> str:
+        normalized = (backend or "claude").strip().lower()
+        if normalized == "opencode":
+            return (self.opencode_default_model or self.default_model or "").strip()
+        return (self.claude_default_model or self.default_model or "").strip()
 
 
 class SettingsStore:

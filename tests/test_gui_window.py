@@ -42,7 +42,8 @@ def test_main_window_applies_claude_sdk_env_from_settings(tmp_path: Path, monkey
             {
                 "default_backend": "claude",
                 "default_output_dir": str(tmp_path / "output"),
-                "default_model": "ark-code-latest",
+                "claude_default_model": "ark-code-latest",
+                "opencode_default_model": "DeepSeek-V3.2",
                 "claude_sdk_base_url": "https://ark.cn-beijing.volces.com/api/coding",
             },
             ensure_ascii=False,
@@ -61,6 +62,7 @@ def test_main_window_applies_claude_sdk_env_from_settings(tmp_path: Path, monkey
     assert os.environ["ANTHROPIC_API_KEY"] == "token-from-env"
     assert window.settings_page.claude_sdk_base_url.text() == "https://ark.cn-beijing.volces.com/api/coding"
     assert window.settings_page.claude_sdk_auth_token.text() == "token-from-env"
+    assert window.review_page.model_edit.text() == "ark-code-latest"
 
     window.close()
     app.quit()
@@ -73,6 +75,8 @@ def test_review_page_form_controls_keep_usable_height(tmp_path: Path, monkeypatc
             {
                 "default_backend": "claude",
                 "default_output_dir": str(tmp_path / "output"),
+                "claude_default_model": "ark-code-latest",
+                "opencode_default_model": "DeepSeek-V3.2",
                 "default_progress_level": "agent",
                 "default_timeout_sec": 1800,
             },
@@ -92,6 +96,7 @@ def test_review_page_form_controls_keep_usable_height(tmp_path: Path, monkeypatc
     page = window.review_page
     assert page.backend_combo.height() >= 34
     assert page.model_edit.height() >= 34
+    assert page.model_edit.text() == "ark-code-latest"
     assert page.progress_combo.height() >= 34
     assert page.output_dir_edit.height() >= 34
     assert page.timeout_spin.height() >= 34
@@ -109,7 +114,8 @@ def test_settings_page_form_controls_keep_usable_height(tmp_path: Path, monkeypa
             {
                 "default_backend": "claude",
                 "default_output_dir": str(tmp_path / "output"),
-                "default_model": "ark-code-latest",
+                "claude_default_model": "ark-code-latest",
+                "opencode_default_model": "DeepSeek-V3.2",
                 "claude_sdk_base_url": "https://ark.cn-beijing.volces.com/api/coding",
                 "default_progress_level": "agent",
                 "default_timeout_sec": 1800,
@@ -131,7 +137,8 @@ def test_settings_page_form_controls_keep_usable_height(tmp_path: Path, monkeypa
 
     page = window.settings_page
     assert page.default_backend.height() >= 34
-    assert page.default_model.height() >= 34
+    assert page.claude_default_model.height() >= 34
+    assert page.opencode_default_model.height() >= 34
     assert page.claude_sdk_base_url.height() >= 34
     assert page.claude_sdk_auth_token.height() >= 34
     assert page.default_progress.height() >= 34
@@ -144,6 +151,46 @@ def test_settings_page_form_controls_keep_usable_height(tmp_path: Path, monkeypa
     assert page.opencode_api_url.height() >= 34
     assert page.opencode_api_key.height() >= 34
     assert page.scroll.widget() is not None
+    assert page.backend_stack.currentIndex() == 0
+
+    page.default_backend.setCurrentText("opencode")
+    app.processEvents()
+    assert page.backend_stack.currentIndex() == 1
+    assert page.backend_section_title.text() == "OpenCode 默认配置"
+
+    window.close()
+    app.quit()
+
+
+def test_review_page_switches_default_model_with_backend(tmp_path: Path, monkeypatch) -> None:
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "default_backend": "claude",
+                "default_output_dir": str(tmp_path / "output"),
+                "claude_default_model": "ark-code-latest",
+                "opencode_default_model": "DeepSeek-V3.2",
+                "default_progress_level": "agent",
+                "default_timeout_sec": 1800,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BID_REVIEW_GUI_SETTINGS_PATH", str(settings_path))
+
+    app = create_application([])
+    window = MainWindow()
+    window.show()
+    window._set_current_page(1)
+    app.processEvents()
+
+    page = window.review_page
+    assert page.model_edit.text() == "ark-code-latest"
+    page.backend_combo.setCurrentText("opencode")
+    app.processEvents()
+    assert page.model_edit.text() == "DeepSeek-V3.2"
 
     window.close()
     app.quit()

@@ -12,6 +12,8 @@ def test_settings_store_round_trip(tmp_path: Path) -> None:
         default_backend="opencode",
         default_output_dir=r"D:\output",
         default_model="DeepSeek-V3.2",
+        claude_default_model="ark-code-latest",
+        opencode_default_model="DeepSeek-V3.2",
         default_progress_level="normal",
         default_timeout_sec=2400,
         default_effort="medium",
@@ -35,9 +37,25 @@ def test_settings_store_round_trip(tmp_path: Path) -> None:
 def test_settings_defaults_pick_up_claude_sdk_env(monkeypatch) -> None:
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding")
     monkeypatch.setenv("ANTHROPIC_MODEL", "ark-code-latest")
+    monkeypatch.setenv("BID_REVIEW_OPENCODE_MODEL", "DeepSeek-V3.2")
 
     settings = DesktopSettings()
 
     assert settings.claude_sdk_base_url == "https://ark.cn-beijing.volces.com/api/coding"
-    assert settings.default_model == "ark-code-latest"
+    assert settings.claude_default_model == "ark-code-latest"
+    assert settings.opencode_default_model == "DeepSeek-V3.2"
+
+
+def test_settings_legacy_default_model_populates_both_backend_models() -> None:
+    settings = DesktopSettings.from_dict(
+        {
+            "default_backend": "claude",
+            "default_model": "legacy-model",
+        }
+    )
+
+    assert settings.claude_default_model == "legacy-model"
+    assert settings.opencode_default_model == "legacy-model"
+    assert settings.model_for_backend("claude") == "legacy-model"
+    assert settings.model_for_backend("opencode") == "legacy-model"
 

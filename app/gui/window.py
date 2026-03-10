@@ -367,6 +367,8 @@ class HomePage(QWidget):
 class ReviewPage(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._backend_model_defaults = {"claude": "", "opencode": ""}
+        self._last_model_backend = "claude"
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(18)
@@ -553,10 +555,20 @@ class ReviewPage(QWidget):
 
         self.output_dir_button.clicked.connect(self._browse_output_dir)
         self.open_output_button.clicked.connect(self._open_output_dir)
+        self.backend_combo.currentTextChanged.connect(self._on_backend_changed)
 
     def load_settings(self, settings: DesktopSettings) -> None:
-        self.backend_combo.setCurrentText(settings.default_backend or "claude")
-        self.model_edit.setText(settings.default_model)
+        self._backend_model_defaults = {
+            "claude": settings.model_for_backend("claude"),
+            "opencode": settings.model_for_backend("opencode"),
+        }
+        backend = settings.default_backend or "claude"
+        self._last_model_backend = backend
+        self.backend_combo.blockSignals(True)
+        self.backend_combo.setCurrentText(backend)
+        self.backend_combo.blockSignals(False)
+        self.model_edit.setText(self._backend_model_defaults.get(backend, ""))
+        self._update_model_placeholder(backend)
         self.progress_combo.setCurrentText(settings.default_progress_level or "agent")
         self.output_dir_edit.setText(settings.default_output_dir)
         self.timeout_spin.setValue(settings.default_timeout_sec or 1800)
@@ -628,6 +640,22 @@ class ReviewPage(QWidget):
 
     def _open_output_dir(self) -> None:
         _open_local_path(self.output_dir_edit.text().strip())
+
+    def _on_backend_changed(self, backend: str) -> None:
+        backend = (backend or "claude").strip().lower()
+        previous_backend = self._last_model_backend
+        current_model = self.model_edit.text().strip()
+        previous_default = self._backend_model_defaults.get(previous_backend, "").strip()
+        if not current_model or current_model == previous_default:
+            self.model_edit.setText(self._backend_model_defaults.get(backend, ""))
+        self._update_model_placeholder(backend)
+        self._last_model_backend = backend
+
+    def _update_model_placeholder(self, backend: str) -> None:
+        if (backend or "claude").strip().lower() == "opencode":
+            self.model_edit.setPlaceholderText("可选，覆盖 OpenCode 默认模型")
+            return
+        self.model_edit.setPlaceholderText("可选，覆盖 Claude SDK 默认模型")
 
 
 class ResultsPage(QWidget):
@@ -831,13 +859,16 @@ class SettingsPage(QWidget):
 
         self.default_backend = QComboBox()
         self.default_backend.addItems(["claude", "opencode"])
-        self.default_model = QLineEdit()
-        self.default_model.setPlaceholderText("Claude SDK 默认读取 ANTHROPIC_MODEL")
         self.default_progress = QComboBox()
         self.default_progress.addItems(["agent", "basic", "normal", "detailed", "events", "raw"])
         self.default_timeout = QSpinBox()
         self.default_timeout.setRange(60, 7200)
         self.default_timeout.setSingleStep(60)
+        self.output_dir = QLineEdit()
+        self.common_output_dir_row = self._path_row(self.output_dir, self._browse_output_dir)
+
+        self.claude_default_model = QLineEdit()
+        self.claude_default_model.setPlaceholderText("Claude SDK 默认读取 ANTHROPIC_MODEL")
         self.default_effort = QComboBox()
         self.default_effort.addItems(["low", "medium", "high"])
         self.claude_sdk_base_url = QLineEdit()
@@ -845,8 +876,10 @@ class SettingsPage(QWidget):
         self.claude_sdk_auth_token = QLineEdit()
         self.claude_sdk_auth_token.setEchoMode(QLineEdit.Password)
         self.claude_sdk_auth_token.setPlaceholderText("仅当前窗口会话使用，不写入 settings.json")
-        self.output_dir = QLineEdit()
         self.claude_bin = QLineEdit()
+
+        self.opencode_default_model = QLineEdit()
+        self.opencode_default_model.setPlaceholderText("OpenCode 默认模型")
         self.opencode_bin = QLineEdit()
         self.opencode_provider = QLineEdit()
         self.opencode_api_url = QLineEdit()
@@ -854,42 +887,71 @@ class SettingsPage(QWidget):
         self.opencode_api_key.setEchoMode(QLineEdit.Password)
         self.opencode_api_key.setPlaceholderText("仅当前窗口会话使用，不写入 settings.json")
 
-        form = QFormLayout()
-        _configure_form_layout(form)
+        common_form = QFormLayout()
+        _configure_form_layout(common_form)
         _pin_form_field_height(self.default_backend)
-        _pin_form_field_height(self.default_model)
         _pin_form_field_height(self.default_progress)
         _pin_form_field_height(self.default_timeout)
+        _pin_form_field_height(self.output_dir)
+        common_title = QLabel("通用默认项")
+        common_title.setObjectName("SectionTitle")
+        common_form.addRow("默认后端", self.default_backend)
+        common_form.addRow("默认进度级别", self.default_progress)
+        common_form.addRow("默认超时（秒）", self.default_timeout)
+        common_form.addRow("默认输出目录", self.common_output_dir_row)
+
+        self.backend_section_title = QLabel("")
+        self.backend_section_title.setObjectName("SectionTitle")
+        self.backend_stack = QStackedWidget()
+
+        claude_page = QWidget()
+        claude_layout = QVBoxLayout(claude_page)
+        claude_layout.setContentsMargins(0, 0, 0, 0)
+        claude_layout.setSpacing(0)
+        claude_form = QFormLayout()
+        _configure_form_layout(claude_form)
+        _pin_form_field_height(self.claude_default_model)
         _pin_form_field_height(self.default_effort)
         _pin_form_field_height(self.claude_sdk_base_url)
         _pin_form_field_height(self.claude_sdk_auth_token)
-        _pin_form_field_height(self.output_dir)
         _pin_form_field_height(self.claude_bin)
+        claude_form.addRow("Claude 模型", self.claude_default_model)
+        claude_form.addRow("Claude SDK base-url", self.claude_sdk_base_url)
+        claude_form.addRow("Claude SDK auth-token", self.claude_sdk_auth_token)
+        claude_form.addRow("默认 Claude effort", self.default_effort)
+        claude_form.addRow("Claude CLI 路径", self._path_row(self.claude_bin, self._browse_claude_bin))
+        claude_layout.addLayout(claude_form)
+
+        opencode_page = QWidget()
+        opencode_layout = QVBoxLayout(opencode_page)
+        opencode_layout.setContentsMargins(0, 0, 0, 0)
+        opencode_layout.setSpacing(0)
+        opencode_form = QFormLayout()
+        _configure_form_layout(opencode_form)
+        _pin_form_field_height(self.opencode_default_model)
         _pin_form_field_height(self.opencode_bin)
         _pin_form_field_height(self.opencode_provider)
         _pin_form_field_height(self.opencode_api_url)
         _pin_form_field_height(self.opencode_api_key)
-        form.addRow("默认后端", self.default_backend)
-        form.addRow("默认模型", self.default_model)
-        form.addRow("Claude SDK base-url", self.claude_sdk_base_url)
-        form.addRow("Claude SDK auth-token", self.claude_sdk_auth_token)
-        form.addRow("默认进度级别", self.default_progress)
-        form.addRow("默认超时（秒）", self.default_timeout)
-        form.addRow("默认 Claude effort", self.default_effort)
-        form.addRow("默认输出目录", self._path_row(self.output_dir, self._browse_output_dir))
-        form.addRow("Claude CLI 路径", self._path_row(self.claude_bin, self._browse_claude_bin))
-        form.addRow("OpenCode 路径", self._path_row(self.opencode_bin, self._browse_opencode_bin))
-        form.addRow("OpenCode provider", self.opencode_provider)
-        form.addRow("OpenCode api-url", self.opencode_api_url)
-        form.addRow("OpenCode api-key", self.opencode_api_key)
-        toolchain_layout.addWidget(toolchain_title)
-        toolchain_layout.addLayout(form)
+        opencode_form.addRow("OpenCode 模型", self.opencode_default_model)
+        opencode_form.addRow("OpenCode 路径", self._path_row(self.opencode_bin, self._browse_opencode_bin))
+        opencode_form.addRow("OpenCode provider", self.opencode_provider)
+        opencode_form.addRow("OpenCode api-url", self.opencode_api_url)
+        opencode_form.addRow("OpenCode api-key", self.opencode_api_key)
+        opencode_layout.addLayout(opencode_form)
 
-        guidance = QLabel(
-            "Claude SDK base-url 会保存到本地设置；Claude auth-token 与 OpenCode api-key 只保留在当前窗口内存。"
-        )
-        guidance.setObjectName("MutedLabel")
-        toolchain_layout.addWidget(guidance)
+        self.backend_stack.addWidget(claude_page)
+        self.backend_stack.addWidget(opencode_page)
+
+        toolchain_layout.addWidget(toolchain_title)
+        toolchain_layout.addWidget(common_title)
+        toolchain_layout.addLayout(common_form)
+        toolchain_layout.addWidget(self.backend_section_title)
+        toolchain_layout.addWidget(self.backend_stack)
+
+        self.guidance = QLabel("")
+        self.guidance.setObjectName("MutedLabel")
+        toolchain_layout.addWidget(self.guidance)
 
         instruction_card = SurfaceFrame("card")
         instruction_layout = QVBoxLayout(instruction_card)
@@ -927,6 +989,7 @@ class SettingsPage(QWidget):
         layout.addWidget(self.scroll, 1)
 
         self.save_button.clicked.connect(self.save_requested.emit)
+        self.default_backend.currentTextChanged.connect(self._apply_backend_mode)
 
     def load_settings(
         self,
@@ -934,8 +997,12 @@ class SettingsPage(QWidget):
         session_api_key: str = "",
         session_claude_auth_token: str = "",
     ) -> None:
-        self.default_backend.setCurrentText(settings.default_backend or "claude")
-        self.default_model.setText(settings.default_model)
+        backend = settings.default_backend or "claude"
+        self.default_backend.blockSignals(True)
+        self.default_backend.setCurrentText(backend)
+        self.default_backend.blockSignals(False)
+        self.claude_default_model.setText(settings.model_for_backend("claude"))
+        self.opencode_default_model.setText(settings.model_for_backend("opencode"))
         self.claude_sdk_base_url.setText(settings.claude_sdk_base_url)
         self.claude_sdk_auth_token.setText(session_claude_auth_token)
         self.default_progress.setCurrentText(settings.default_progress_level or "agent")
@@ -949,12 +1016,18 @@ class SettingsPage(QWidget):
         self.opencode_api_key.setText(session_api_key)
         self.default_instruction.setPlainText(settings.default_instruction)
         self.default_user_instruction.setPlainText(settings.default_user_instruction)
+        self._apply_backend_mode(backend)
 
     def snapshot(self, previous: DesktopSettings) -> DesktopSettings:
+        backend = self.default_backend.currentText().strip()
+        claude_model = self.claude_default_model.text().strip()
+        opencode_model = self.opencode_default_model.text().strip()
         return DesktopSettings(
-            default_backend=self.default_backend.currentText().strip(),
+            default_backend=backend,
             default_output_dir=self.output_dir.text().strip(),
-            default_model=self.default_model.text().strip(),
+            default_model=claude_model if backend == "claude" else opencode_model,
+            claude_default_model=claude_model,
+            opencode_default_model=opencode_model,
             default_progress_level=self.default_progress.currentText().strip(),
             default_timeout_sec=self.default_timeout.value(),
             default_effort=self.default_effort.currentText().strip(),
@@ -974,6 +1047,18 @@ class SettingsPage(QWidget):
 
     def session_claude_auth_token(self) -> str:
         return self.claude_sdk_auth_token.text().strip()
+
+    def _apply_backend_mode(self, backend: str) -> None:
+        normalized = (backend or "claude").strip().lower()
+        if normalized == "opencode":
+            self.backend_section_title.setText("OpenCode 默认配置")
+            self.backend_stack.setCurrentIndex(1)
+            self.guidance.setText("OpenCode provider 与 api-url 会保存到本地设置；api-key 只保留在当前窗口内存。")
+            return
+
+        self.backend_section_title.setText("Claude 默认配置")
+        self.backend_stack.setCurrentIndex(0)
+        self.guidance.setText("Claude SDK base-url 会保存到本地设置；Claude auth-token 只保留在当前窗口内存。")
 
     def _path_row(self, line_edit: QLineEdit, browse_callback) -> QWidget:
         row = QWidget()
@@ -1124,7 +1209,7 @@ class MainWindow(QMainWindow):
     def _apply_claude_sdk_env(self) -> None:
         env_mapping = {
             "ANTHROPIC_BASE_URL": self.settings.claude_sdk_base_url.strip(),
-            "ANTHROPIC_MODEL": self.settings.default_model.strip(),
+            "ANTHROPIC_MODEL": self.settings.model_for_backend("claude"),
             "ANTHROPIC_AUTH_TOKEN": self.session_claude_auth_token.strip(),
         }
         for key, value in env_mapping.items():
