@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from app.llm.client_factory import create_llm_client
 from app.llm.claude_client import ClaudeClient
 from app.llm.opencode_client import OpenCodeClient
@@ -25,6 +27,10 @@ def test_backend_switch_create_claude_client() -> None:
     assert backend == "claude"
     assert isinstance(client, ClaudeClient)
     assert client.model == "claude-model"
+    assert client.mcp_config is not None
+    data = json.loads(client.mcp_config)
+    assert "document-parser" in data["mcpServers"]
+    assert "paddle-ocr" in data["mcpServers"]
 
 
 def test_backend_switch_create_opencode_client_prefers_opencode_model() -> None:
@@ -48,7 +54,7 @@ def test_backend_switch_create_opencode_client_prefers_opencode_model() -> None:
     assert isinstance(client, OpenCodeClient)
     assert client.model == "DeepSeek-V3.2"
     assert client.api_url == "https://ark.cn-beijing.volces.com/api/coding/v3"
-    assert client.mcp_config is None
+    assert client.mcp_config is not None
 
 
 def test_opencode_model_falls_back_to_env_default(monkeypatch) -> None:

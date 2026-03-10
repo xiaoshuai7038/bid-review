@@ -4,11 +4,8 @@ import importlib.util
 import json
 import os
 import re
-import queue
 import shutil
-import subprocess
 import sys
-import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -115,81 +112,10 @@ class ClaudeClient:
     progress_heartbeat_sec: int = 20
     progress_level: str = "agent"
     workspace: str | None = None
-    mcp_config: str | None = None
+    mcp_config: Any = None
     progress_callback: Callable[[str, str], None] | None = None
     _last_tool_calls: list[str] = field(default_factory=list, init=False, repr=False)
     _last_tool_uses: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
-
-    def _resolve_claude_bin(self) -> str:
-        if self.claude_bin:
-            return str(Path(self.claude_bin).expanduser())
-        bundled = self._bundled_cli_path()
-        if bundled is not None:
-            self.claude_bin = str(bundled)
-            return self.claude_bin
-        env_bin = os.getenv("CLAUDE_BIN")
-        if env_bin:
-            self.claude_bin = env_bin
-            return env_bin
-        for candidate in ("claude", "claude.cmd"):
-            found = shutil.which(candidate)
-            if found:
-                self.claude_bin = found
-                return found
-        userprofile = os.getenv("USERPROFILE", "")
-        fallback = Path(userprofile) / "AppData" / "Roaming" / "npm" / "claude.cmd"
-        self.claude_bin = str(fallback)
-        return self.claude_bin
-
-    def _base_cmd(self, output_format: str = "text") -> list[str]:
-        cmd = [
-            self._resolve_claude_bin(),
-            "--agent",
-            self.agent,
-            "--print",
-            "--output-format",
-            output_format,
-            "--no-session-persistence",
-            "--permission-mode",
-            "dontAsk",
-            "--dangerously-skip-permissions",
-        ]
-        if self.model:
-            cmd.extend(["--model", self.model])
-        if self.effort:
-            cmd.extend(["--effort", self.effort])
-        if self.tools:
-            cmd.extend(["--tools", self.tools])
-        if self.workspace:
-            cmd.extend(["--add-dir", self.workspace])
-        if self.mcp_config:
-            cmd.extend(["--mcp-config", self.mcp_config])
-        if output_format == "stream-json":
-            cmd.append("--include-partial-messages")
-        return cmd
-
-    @staticmethod
-    def _reader_thread(stream: Any, out_queue: "queue.Queue[str | None]") -> None:
-        try:
-            for line in iter(stream.readline, ""):
-                out_queue.put(line)
-        finally:
-            out_queue.put(None)
-
-    @staticmethod
-    def _drain_queue_nowait(src_queue: "queue.Queue[str | None]") -> tuple[list[str], bool]:
-        lines: list[str] = []
-        done = False
-        while True:
-            try:
-                item = src_queue.get_nowait()
-            except queue.Empty:
-                break
-            if item is None:
-                done = True
-            else:
-                lines.append(item)
-        return lines, done
 
     def _emit_progress(self, message: str, level: str = "normal") -> None:
         if not self.show_progress:
@@ -341,17 +267,36 @@ class ClaudeClient:
         parsed = [item.strip() for item in tools.split(",") if item.strip()]
         return parsed or None
 
+    def _sdk_mcp_servers(self) -> dict[str, Any] | str | Path:
+        if not self.mcp_config:
+            return {}
+        if isinstance(self.mcp_config, dict):
+            return dict(self.mcp_config.get("mcpServers", self.mcp_config))
+        raw = str(self.mcp_config).strip()
+        if not raw:
+            return {}
+        candidate = Path(raw).expanduser()
+        if candidate.exists() and candidate.is_file():
+            try:
+                data = json.loads(candidate.read_text(encoding="utf-8"))
+            except Exception:
+                return candidate
+            if isinstance(data, dict):
+                return dict(data.get("mcpServers", data))
+            return candidate
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return raw
+        if isinstance(data, dict):
+            return dict(data.get("mcpServers", data))
+        return raw
+
     def _build_options(self, sdk: dict[str, Any], stderr_callback: Callable[[str], None]) -> Any:
         ClaudeAgentOptions = sdk["ClaudeAgentOptions"]
         extra_args: dict[str, str | None] = {}
         if self.agent:
             extra_args["agent"] = self.agent
-
-        mcp_servers: dict[str, Any] | str | Path
-        if self.mcp_config:
-            mcp_servers = self.mcp_config
-        else:
-            mcp_servers = {}
 
         return ClaudeAgentOptions(
             tools=self._build_tools_option(),
@@ -361,7 +306,7 @@ class ClaudeClient:
             add_dirs=[self.workspace] if self.workspace else [],
             cli_path=self.claude_bin or None,
             permission_mode="bypassPermissions",
-            mcp_servers=mcp_servers,
+            mcp_servers=self._sdk_mcp_servers(),
             include_partial_messages=self.progress_level in {"raw", "events"},
             extra_args=extra_args,
             env=self._build_sdk_env(),
@@ -643,203 +588,6 @@ class ClaudeClient:
             if stderr_text:
                 raise ClaudeCallError(f"Claude SDK 返回空输出: {stderr_text}")
             raise ClaudeCallError("Claude SDK 返回空输出。")
-
-        self._last_tool_calls = tool_calls
-        self._last_tool_uses = tool_uses
-        return out
-
-    def _ask_text_via_cli(self, prompt: str, *, task_label: str | None = None) -> str:
-        self._last_tool_calls = []
-        self._last_tool_uses = []
-        cmd = self._base_cmd("stream-json")
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=self.workspace or None,
-            bufsize=1,
-        )
-
-        if proc.stdin is None or proc.stdout is None or proc.stderr is None:
-            proc.kill()
-            raise ClaudeCallError("Claude CLI 子进程管道初始化失败。")
-
-        stdout_queue: "queue.Queue[str | None]" = queue.Queue()
-        stderr_queue: "queue.Queue[str | None]" = queue.Queue()
-        stdout_thread = threading.Thread(target=self._reader_thread, args=(proc.stdout, stdout_queue), daemon=True)
-        stderr_thread = threading.Thread(target=self._reader_thread, args=(proc.stderr, stderr_queue), daemon=True)
-        stdout_thread.start()
-        stderr_thread.start()
-
-        proc.stdin.write(prompt)
-        proc.stdin.close()
-
-        start_ts = time.time()
-        last_heartbeat = start_ts
-        raw_lines: list[str] = []
-        stderr_lines: list[str] = []
-        stdout_done = False
-        stderr_done = False
-        final_result = ""
-        text_chunks: list[str] = []
-        tool_count = 0
-        tool_calls: list[str] = []
-        tool_uses: list[dict[str, Any]] = []
-        first_text_logged = False
-        current_phase = ""
-        current_phase_obj: Phase | None = None
-        phase_started_ts = start_ts
-        phase_tool_count = 0
-        phase_result_hint = ""
-        label = (task_label or "审查任务").strip()
-        needs_json_parsing = self.progress_level not in {"raw", "events"}
-
-        if self.progress_level == "agent":
-            self._emit_progress(f"[agent] {label}：已提交，开始处理", level="agent")
-            self._emit_progress(
-                "[agent] 思路：先识别文件角色，再提取硬性要求，然后逐条比对，最后整理报告",
-                level="agent",
-            )
-
-        while True:
-            now = time.time()
-            if now - start_ts > self.timeout_sec:
-                proc.kill()
-                raise ClaudeCallError(f"Claude CLI 调用超时（>{self.timeout_sec}s）")
-
-            line: str | None = None
-            try:
-                line = stdout_queue.get(timeout=1)
-            except queue.Empty:
-                pass
-
-            if line is None:
-                stdout_done = True
-            elif line is not None:
-                raw_line = line.rstrip("\n")
-                raw_lines.append(raw_line)
-                event = None
-                if needs_json_parsing:
-                    try:
-                        event = json.loads(raw_line)
-                    except Exception:
-                        pass
-                else:
-                    if self.progress_level == "raw":
-                        self._emit_progress(raw_line, level="raw")
-                    elif self.progress_level == "events":
-                        if '"type":"stream_event"' not in raw_line or '"content_block_delta"' not in raw_line:
-                            self._emit_progress(raw_line, level="events")
-
-                if isinstance(event, dict):
-                    event_type = event.get("type")
-                    if event_type == "system" and event.get("subtype") == "init":
-                        model_name = event.get("model", "")
-                        session_id = event.get("session_id", "")
-                        if self.progress_level == "agent":
-                            self._emit_progress(
-                                f"[agent] 会话已建立：session={session_id} model={model_name}",
-                                level="agent",
-                            )
-                        else:
-                            self._emit_progress(
-                                f"[claude] 已启动 session={session_id} model={model_name}",
-                                level="basic",
-                            )
-                    elif event_type == "assistant":
-                        msg = event.get("message", {})
-                        contents = msg.get("content", [])
-                        if isinstance(contents, list):
-                            for item in contents:
-                                if not isinstance(item, dict):
-                                    continue
-                                item_type = item.get("type")
-                                if item_type == "tool_use":
-                                    tool_count += 1
-                                    tool_name = item.get("name", "tool")
-                                    tool_calls.append(str(tool_name))
-                                    tool_input = item.get("input")
-                                    tool_uses.append({"name": str(tool_name), "input": tool_input})
-                                    phase_obj = self._infer_phase_from_tool(tool_name, tool_input)
-                                    phase_str = str(phase_obj)
-                                    if self.progress_level == "agent":
-                                        if current_phase_obj and phase_obj.rank() < current_phase_obj.rank():
-                                            phase_obj = current_phase_obj
-                                            phase_str = str(phase_obj)
-                                        if phase_str != current_phase:
-                                            if current_phase:
-                                                self._report_phase_completion(
-                                                    current_phase,
-                                                    phase_started_ts,
-                                                    phase_result_hint,
-                                                    phase_tool_count,
-                                                )
-                                            current_phase = phase_str
-                                            current_phase_obj = phase_obj
-                                            phase_started_ts = time.time()
-                                            phase_tool_count = 0
-                                            phase_result_hint = ""
-                                            self._emit_progress(
-                                                f"[agent] 当前阶段：{phase_str}；下一步：{phase_obj.next_hint()}",
-                                                level="agent",
-                                            )
-                                        phase_tool_count += 1
-                                    self._emit_progress(
-                                        f"[claude] 调用工具 #{tool_count}: {tool_name}",
-                                        level="normal",
-                                    )
-                                elif item_type == "text":
-                                    text = str(item.get("text") or "").strip()
-                                    if not text:
-                                        continue
-                                    text_chunks.append(text)
-                                    if self.progress_level == "agent" and current_phase and not phase_result_hint:
-                                        phase_result_hint = f"收到输出片段：{self._short_text(text, 80)}"
-                                    elif not first_text_logged:
-                                        self._emit_progress(
-                                            f"[claude] 收到输出片段: {self._short_text(text, 80)}",
-                                            level="normal",
-                                        )
-                                        first_text_logged = True
-                    elif event_type == "result":
-                        subtype = str(event.get("subtype", "") or "")
-                        if subtype == "success":
-                            result = event.get("result")
-                            if isinstance(result, str):
-                                final_result = result.strip()
-                        elif subtype == "error":
-                            raise ClaudeCallError(str(event.get("result") or event.get("error") or "Claude CLI 返回错误结果。"))
-
-            stderr_now, stderr_finished = self._drain_queue_nowait(stderr_queue)
-            if stderr_now:
-                stderr_lines.extend([line.rstrip("\n") for line in stderr_now if line is not None])
-            if stderr_finished:
-                stderr_done = True
-
-            if now - last_heartbeat >= self.progress_heartbeat_sec:
-                elapsed = int(now - start_ts)
-                if self.progress_level == "agent":
-                    if current_phase:
-                        self._emit_progress(f"[agent] 进行中：{current_phase}（已用时 {elapsed}s）", level="agent")
-                    else:
-                        self._emit_progress(f"[agent] 进行中：等待模型响应（已用时 {elapsed}s）", level="agent")
-                else:
-                    self._emit_progress(f"[claude] 仍在处理... 已等待 {elapsed}s", level="basic")
-                last_heartbeat = now
-
-            if stdout_done and stderr_done:
-                break
-
-        returncode = proc.wait(timeout=5)
-        stderr_text = "\n".join([line for line in stderr_lines if line.strip()]).strip()
-        if returncode != 0:
-            raise ClaudeCallError(stderr_text or f"Claude CLI 退出码异常: {returncode}")
-
-        out = final_result or "\n".join(text_chunks).strip()
-        if not out:
-            raise ClaudeCallError(stderr_text or "Claude CLI 返回空输出。")
 
         self._last_tool_calls = tool_calls
         self._last_tool_uses = tool_uses

@@ -37,6 +37,12 @@ uv run python -m app.main `
 ```
 
 `claude` 后端现已通过项目依赖内置的 Claude Agent SDK 运行，不再要求客户环境额外全局安装 `claude` CLI。
+项目会默认挂载仓库内统一管理的 MCP 能力：
+
+- `document-parser`
+- `paddle-ocr`
+
+这两项能力由项目代码直接托管，不再依赖客户机手工维护 `~/.claude/mcp/*.json`。
 默认会优先读取以下环境变量：
 
 ```powershell
@@ -48,6 +54,8 @@ $env:ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 - `ANTHROPIC_AUTH_TOKEN`：推荐，作为 Claude SDK/运行时的默认鉴权来源
 - `ANTHROPIC_MODEL`：可选，作为 `claude` 后端默认模型
 - `ANTHROPIC_BASE_URL`：可选，自定义 Claude API 网关地址
+- `OCRMCP_BACKEND_URL`：可选，覆盖项目内 OCR MCP bridge 的远端服务地址
+- `OCRMCP_API_KEY`：可选，远端 OCR 服务鉴权
 
 如需显式覆盖 Claude Code 可执行文件路径，仍可继续传 `--claude-bin`；未传时默认使用 SDK 自带 bundled CLI。
 
@@ -124,9 +132,8 @@ uv run python -m app.main `
   --output-dir "data/output"
 ```
 
-默认情况下，`--backend opencode` 会自动复用本机 `~/.claude/mcp/*.json` 中已安装的 MCP 服务定义，
-并优先按项目内 `.claude/settings.local.json` 的允许列表筛选需要挂载的服务器。
-如需显式指定，也可以继续传 `--mcp-config`（支持 Claude 风格 `mcpServers` JSON）。
+默认情况下，`--backend opencode` 也会优先使用仓库内统一管理的 MCP 配置。
+如需显式指定，也可以继续传 `--mcp-config`（支持 Claude 风格 `mcpServers` JSON）；显式传入时会覆盖项目默认配置。
 
 如不需要保存每次运行的原始文本（`claude_raw_output.txt`），可加：
 

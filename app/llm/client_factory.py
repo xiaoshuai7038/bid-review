@@ -5,6 +5,7 @@ from typing import Any, Callable, Literal, Protocol, runtime_checkable
 
 from app.llm.claude_client import ClaudeClient
 from app.llm.opencode_client import OpenCodeClient
+from app.llm.project_mcp import build_project_mcp_config_json
 
 BackendName = Literal["claude", "opencode"]
 
@@ -52,6 +53,7 @@ def create_llm_client(
     opencode_provider: str,
     progress_callback: Callable[[str, str], None] | None = None,
 ) -> tuple[BackendName, LLMClient]:
+    effective_mcp_config = mcp_config or build_project_mcp_config_json(workspace)
     selected = normalize_backend(backend)
     if selected == "claude":
         return selected, ClaudeClient(
@@ -62,7 +64,7 @@ def create_llm_client(
             progress_level=progress_level,
             timeout_sec=timeout_sec,
             workspace=workspace,
-            mcp_config=mcp_config,
+            mcp_config=effective_mcp_config,
             progress_callback=progress_callback,
         )
 
@@ -74,7 +76,7 @@ def create_llm_client(
         progress_level=progress_level,
         timeout_sec=timeout_sec,
         workspace=workspace,
-        mcp_config=mcp_config,
+        mcp_config=effective_mcp_config,
         api_key=opencode_api_key,
         api_url=opencode_api_url,
         provider_id=opencode_provider,
