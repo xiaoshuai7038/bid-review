@@ -117,7 +117,9 @@ def run_pipeline(
     )
     if not client.available():
         if selected_backend == "claude":
-            raise RuntimeError("未检测到可用的 claude CLI，请先安装并登录。")
+            raise RuntimeError(
+                "未检测到可用的 Claude SDK 运行时。请先执行 `uv sync` 安装依赖，并配置 ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY。"
+            )
         raise RuntimeError(
             "未检测到可用的 opencode CLI，请先安装并完成认证，或传入 --opencode-api-key/--opencode-api-url。"
         )

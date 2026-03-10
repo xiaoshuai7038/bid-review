@@ -24,7 +24,7 @@ def _merge_non_empty(parts: list[str]) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="将招标/投标文件交给 Claude/OpenCode CLI 执行标书审查并输出报告。"
+        description="将招标/投标文件交给 Claude SDK 或 OpenCode CLI 执行标书审查并输出报告。"
     )
     parser.add_argument(
         "--backend",
@@ -46,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--claude-bin",
         type=str,
         default=None,
-        help="可选，claude 可执行文件路径（例如 C:/Users/<you>/AppData/Roaming/npm/claude.cmd）。",
+        help="可选，Claude SDK 使用的 Claude Code 可执行文件路径；未传时优先使用 SDK 自带 bundled CLI。",
     )
     parser.add_argument(
         "--model",

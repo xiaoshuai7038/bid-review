@@ -41,7 +41,7 @@ def test_opencode_missing_binary_shows_clear_error(
         orchestrator.run_pipeline(backend="opencode", **_pipeline_kwargs(tmp_path))
 
 
-def test_claude_unavailable_error_message_unchanged(
+def test_claude_unavailable_error_message_mentions_sdk(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
     monkeypatch.setattr(
@@ -49,6 +49,6 @@ def test_claude_unavailable_error_message_unchanged(
         "create_llm_client",
         lambda **kwargs: ("claude", _UnavailableClient()),
     )
-    with pytest.raises(RuntimeError, match="未检测到可用的 claude CLI，请先安装并登录。"):
+    with pytest.raises(RuntimeError, match="未检测到可用的 Claude SDK 运行时"):
         orchestrator.run_pipeline(**_pipeline_kwargs(tmp_path))
 

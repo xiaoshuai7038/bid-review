@@ -4,8 +4,8 @@
 
 下文命令中的文件路径均为占位示例，请替换为你本机的实际文件路径：
 
-1. 本地项目把文件路径和任务提示词交给 LLM CLI（默认 `claude`，可切换 `opencode`）。
-2. 文档解析、招投标识别、硬性条款提取、逐条审查全部由所选 CLI 执行。
+1. 本地项目把文件路径和任务提示词交给 Claude SDK 运行时或 OpenCode CLI（默认 `claude`，可切换 `opencode`）。
+2. 文档解析、招投标识别、硬性条款提取、逐条审查全部由所选后端执行。
 3. 本地项目只负责接收返回 JSON，并导出 `markdown + json + docx` 报告。
 4. 默认包含“主体名词上下文一致性校验”：会检查招标人/投标人/开户银行等名词是否出现在正确位置与正确主体语境中。
 
@@ -35,6 +35,21 @@ uv run python -m app.main `
   --input "C:\path\to\bid-document.docx" `
   --output-dir "data/output"
 ```
+
+`claude` 后端现已通过项目依赖内置的 Claude Agent SDK 运行，不再要求客户环境额外全局安装 `claude` CLI。
+默认会优先读取以下环境变量：
+
+```powershell
+$env:ANTHROPIC_AUTH_TOKEN = "<your-token>"
+$env:ANTHROPIC_MODEL = "claude-sonnet-4-5"
+$env:ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+```
+
+- `ANTHROPIC_AUTH_TOKEN`：推荐，作为 Claude SDK/运行时的默认鉴权来源
+- `ANTHROPIC_MODEL`：可选，作为 `claude` 后端默认模型
+- `ANTHROPIC_BASE_URL`：可选，自定义 Claude API 网关地址
+
+如需显式覆盖 Claude Code 可执行文件路径，仍可继续传 `--claude-bin`；未传时默认使用 SDK 自带 bundled CLI。
 
 或手动指定角色（PowerShell）：
 
@@ -212,7 +227,7 @@ uv run python -m app.main --input "..." --input "..." --progress-level normal
 uv run python -m app.main --input "..." --input "..." --progress-level detailed
 ```
 
-如需不做内容裁剪、尽量原样看 Claude CLI 的流式事件，可加：
+如需不做内容裁剪、尽量原样看 Claude SDK 内部 Claude Code 运行时的流式事件，可加：
 
 ```powershell
 uv run python -m app.main --input "..." --input "..." --progress-level raw
@@ -296,7 +311,10 @@ dist\BidReviewDesktopStandalone\BidReviewDesktopStandalone.exe
 
 - Python 3.10+
 - `uv`（已用于环境和依赖管理）
-- 本机已安装并可运行 `claude` CLI（`claude --version`）
+- `claude` 后端无需额外全局安装 `claude` CLI；执行 `uv sync` 后会安装项目依赖中的 `claude-agent-sdk`
+- 使用 `claude` 后端时，需配置 `ANTHROPIC_AUTH_TOKEN`
+- 可选：`ANTHROPIC_MODEL`
+- 可选：`ANTHROPIC_BASE_URL`
 - 如使用 OpenCode 后端：本机已安装并可运行 `opencode` CLI（`opencode --version`）
 - 如使用 OpenCode 后端并希望复用 OCR/PDF/Word 工具：本机已安装对应 Claude MCP，或通过 `--mcp-config` 显式传入
 - `claude` 侧已配置 PDF/Word/OCR 的 MCP（推荐）
@@ -304,10 +322,11 @@ dist\BidReviewDesktopStandalone\BidReviewDesktopStandalone.exe
 
 ## 说明
 
-- 本项目不会在本地做条款抽取和审查判定，所选后端 CLI 负责完整审查逻辑。
+- 本项目不会在本地做条款抽取和审查判定，所选后端负责完整审查逻辑。
 - 若后端返回格式异常，程序会报错并保留 `claude_raw_output.txt` 便于排查。
 - 默认后端是 `claude`；可用 `--backend opencode` 切换。
-- 默认不显式指定 Claude 模型，直接使用你本机 Claude CLI 已配置的默认模型；如需临时覆盖可传 `--model`。
+- 默认不显式指定 Claude 模型参数时，会优先读取 `ANTHROPIC_MODEL`；如需临时覆盖可传 `--model`。
+- `claude` 后端通过项目内置 Claude Agent SDK 调远端模型，不是本地离线推理。
 - 默认不显式指定 OpenCode 模型与网关时，沿用你本机 OpenCode 已配置的默认值；如需临时覆盖，可传 `--opencode-provider/--opencode-api-url/--opencode-model/--opencode-api-key`。
 - 提示词已配置化，位于 `app/llm/prompts/`（可直接修改模板）。
 - 可通过环境变量 `BID_REVIEW_PROMPTS_DIR` 指向自定义提示词目录（文件名需保持一致）。
