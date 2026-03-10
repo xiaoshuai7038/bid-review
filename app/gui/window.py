@@ -80,6 +80,12 @@ PROGRESS_LEVEL_ITEMS: list[tuple[str, str]] = [
     ("全部过程都显示", "raw"),
 ]
 
+EFFORT_ITEMS: list[tuple[str, str]] = [
+    ("快速", "low"),
+    ("标准", "medium"),
+    ("仔细", "high"),
+]
+
 
 def _pin_form_field_height(widget: QWidget, min_height: int = 40) -> None:
     widget.setMinimumHeight(min_height)
@@ -101,6 +107,12 @@ def _populate_progress_level_combo(combo: QComboBox) -> None:
         combo.addItem(label, value)
 
 
+def _populate_effort_combo(combo: QComboBox) -> None:
+    combo.clear()
+    for label, value in EFFORT_ITEMS:
+        combo.addItem(label, value)
+
+
 def _set_combo_value(combo: QComboBox, value: str) -> None:
     target = (value or "").strip()
     for index in range(combo.count()):
@@ -116,6 +128,46 @@ def _combo_value(combo: QComboBox) -> str:
     if data is not None:
         return str(data).strip()
     return combo.currentText().strip()
+
+
+class AutoResizingPlainTextEdit(QPlainTextEdit):
+    def __init__(
+        self,
+        *,
+        min_rows: int = 2,
+        max_rows: int = 8,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._min_rows = min_rows
+        self._max_rows = max(max_rows, min_rows)
+        self.document().documentLayout().documentSizeChanged.connect(self._update_height)
+        self.textChanged.connect(self._update_height)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._update_height()
+
+    def _update_height(self, *args) -> None:  # noqa: ANN002
+        metrics = self.fontMetrics()
+        row_height = metrics.lineSpacing()
+        margins = self.contentsMargins()
+        document_margin = int(self.document().documentMargin() * 2)
+        frame = self.frameWidth() * 2
+        padding = 20
+        block_count = max(1, self.document().blockCount())
+        visible_rows = max(self._min_rows, min(self._max_rows, block_count))
+        target_height = (
+            visible_rows * row_height
+            + document_margin
+            + frame
+            + margins.top()
+            + margins.bottom()
+            + padding
+        )
+        self.setFixedHeight(target_height)
+        if block_count > self._max_rows:
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        else:
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
 
 class SurfaceFrame(QFrame):
@@ -441,7 +493,7 @@ class ReviewPage(QWidget):
         self.timeout_spin.setRange(60, 7200)
         self.timeout_spin.setSingleStep(60)
         self.effort_combo = QComboBox()
-        self.effort_combo.addItems(["low", "medium", "high"])
+        _populate_effort_combo(self.effort_combo)
         self.save_raw_checkbox = QCheckBox("保存原始输出（claude_raw_output.txt）")
         self.save_raw_checkbox.setChecked(True)
 
@@ -472,7 +524,7 @@ class ReviewPage(QWidget):
         output_wrap.setLayout(output_row)
         form.addRow("输出目录", output_wrap)
         form.addRow("超时（秒）", self.timeout_spin)
-        form.addRow("Claude effort", self.effort_combo)
+        form.addRow("审查仔细程度", self.effort_combo)
 
         config_layout.addWidget(config_title)
         config_layout.addLayout(form)
@@ -486,11 +538,9 @@ class ReviewPage(QWidget):
         instruction_title.setObjectName("SectionTitle")
         instruction_note = QLabel("这里传入的是现有 CLI 的 `--instruction` 与 `--user-instruction`。")
         instruction_note.setObjectName("MutedLabel")
-        self.instruction_edit = QPlainTextEdit()
-        self.instruction_edit.setMinimumHeight(78)
+        self.instruction_edit = AutoResizingPlainTextEdit(min_rows=2, max_rows=8)
         self.instruction_edit.setPlaceholderText("附加任务指令")
-        self.user_instruction_edit = QPlainTextEdit()
-        self.user_instruction_edit.setMinimumHeight(78)
+        self.user_instruction_edit = AutoResizingPlainTextEdit(min_rows=2, max_rows=8)
         self.user_instruction_edit.setPlaceholderText("用户个人指令")
         instruction_layout.addWidget(instruction_title)
         instruction_layout.addWidget(instruction_note)
@@ -605,7 +655,7 @@ class ReviewPage(QWidget):
         _set_combo_value(self.progress_combo, settings.default_progress_level or "agent")
         self.output_dir_edit.setText(settings.default_output_dir)
         self.timeout_spin.setValue(settings.default_timeout_sec or 1800)
-        self.effort_combo.setCurrentText(settings.default_effort or "low")
+        _set_combo_value(self.effort_combo, settings.default_effort or "low")
         self.instruction_edit.setPlainText(settings.default_instruction)
         self.user_instruction_edit.setPlainText(settings.default_user_instruction)
 
@@ -623,7 +673,7 @@ class ReviewPage(QWidget):
             opencode_api_key=session_api_key.strip(),
             progress_level=_combo_value(self.progress_combo),
             timeout_sec=self.timeout_spin.value(),
-            effort=self.effort_combo.currentText().strip(),
+            effort=_combo_value(self.effort_combo),
             instruction=self.instruction_edit.toPlainText().strip(),
             user_instruction=self.user_instruction_edit.toPlainText().strip(),
             save_raw_output=self.save_raw_checkbox.isChecked(),
@@ -903,7 +953,7 @@ class SettingsPage(QWidget):
         self.claude_default_model = QLineEdit()
         self.claude_default_model.setPlaceholderText("Claude SDK 默认读取 ANTHROPIC_MODEL")
         self.default_effort = QComboBox()
-        self.default_effort.addItems(["low", "medium", "high"])
+        _populate_effort_combo(self.default_effort)
         self.claude_sdk_base_url = QLineEdit()
         self.claude_sdk_base_url.setPlaceholderText("https://ark.cn-beijing.volces.com/api/coding")
         self.claude_sdk_auth_token = QLineEdit()
@@ -951,7 +1001,7 @@ class SettingsPage(QWidget):
         claude_form.addRow("Claude 模型", self.claude_default_model)
         claude_form.addRow("Claude SDK base-url", self.claude_sdk_base_url)
         claude_form.addRow("Claude SDK auth-token", self.claude_sdk_auth_token)
-        claude_form.addRow("默认 Claude effort", self.default_effort)
+        claude_form.addRow("默认审查仔细程度", self.default_effort)
         claude_layout.addLayout(claude_form)
 
         self.claude_advanced_toggle = QPushButton("高级可选")
@@ -1058,7 +1108,7 @@ class SettingsPage(QWidget):
         self.claude_sdk_auth_token.setText(session_claude_auth_token)
         _set_combo_value(self.default_progress, settings.default_progress_level or "agent")
         self.default_timeout.setValue(settings.default_timeout_sec or 1800)
-        self.default_effort.setCurrentText(settings.default_effort or "low")
+        _set_combo_value(self.default_effort, settings.default_effort or "low")
         self.output_dir.setText(settings.default_output_dir)
         self.claude_bin.setText(settings.claude_bin)
         self.opencode_bin.setText(settings.opencode_bin)
@@ -1081,7 +1131,7 @@ class SettingsPage(QWidget):
             opencode_default_model=opencode_model,
             default_progress_level=_combo_value(self.default_progress),
             default_timeout_sec=self.default_timeout.value(),
-            default_effort=self.default_effort.currentText().strip(),
+            default_effort=_combo_value(self.default_effort),
             default_instruction=self.default_instruction.toPlainText().strip(),
             default_user_instruction=self.default_user_instruction.toPlainText().strip(),
             claude_sdk_base_url=self.claude_sdk_base_url.text().strip(),

@@ -103,6 +103,10 @@ def test_review_page_form_controls_keep_usable_height(tmp_path: Path, monkeypatc
     assert page.output_dir_edit.height() >= 34
     assert page.timeout_spin.height() >= 34
     assert page.effort_combo.height() >= 34
+    assert page.effort_combo.currentText() == "快速"
+    assert page.effort_combo.currentData() == "low"
+    assert page.instruction_edit.height() < 160
+    assert page.user_instruction_edit.height() < 160
     assert page.left_scroll.widget() is not None
 
     window.close()
@@ -148,6 +152,8 @@ def test_settings_page_form_controls_keep_usable_height(tmp_path: Path, monkeypa
     assert page.default_progress.height() >= 34
     assert page.default_timeout.height() >= 34
     assert page.default_effort.height() >= 34
+    assert page.default_effort.currentText() == "快速"
+    assert page.default_effort.currentData() == "low"
     assert page.output_dir.height() >= 34
     assert not page.claude_advanced_panel.isVisible()
     assert page.opencode_bin.height() >= 34
@@ -232,6 +238,71 @@ def test_progress_level_combo_uses_chinese_labels_but_keeps_internal_values(tmp_
     assert review_page.progress_combo.currentData() == "detailed"
     assert settings_page.default_progress.currentText() == "查看详细步骤"
     assert settings_page.default_progress.currentData() == "detailed"
+
+    window.close()
+    app.quit()
+
+
+def test_effort_combo_uses_chinese_labels_but_keeps_internal_values(tmp_path: Path, monkeypatch) -> None:
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "default_backend": "claude",
+                "default_output_dir": str(tmp_path / "output"),
+                "default_effort": "high",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BID_REVIEW_GUI_SETTINGS_PATH", str(settings_path))
+
+    app = create_application([])
+    window = MainWindow()
+    window.show()
+    window._set_current_page(1)
+    app.processEvents()
+
+    review_page = window.review_page
+    settings_page = window.settings_page
+    assert review_page.effort_combo.currentText() == "仔细"
+    assert review_page.effort_combo.currentData() == "high"
+    assert settings_page.default_effort.currentText() == "仔细"
+    assert settings_page.default_effort.currentData() == "high"
+
+    window.close()
+    app.quit()
+
+
+def test_review_page_instruction_editors_auto_grow_with_content(tmp_path: Path, monkeypatch) -> None:
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "default_backend": "claude",
+                "default_output_dir": str(tmp_path / "output"),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BID_REVIEW_GUI_SETTINGS_PATH", str(settings_path))
+
+    app = create_application([])
+    window = MainWindow()
+    window.show()
+    window._set_current_page(1)
+    app.processEvents()
+
+    page = window.review_page
+    initial_height = page.instruction_edit.height()
+    page.instruction_edit.setPlainText("\n".join([f"第{i}行说明" for i in range(1, 7)]))
+    app.processEvents()
+    grown_height = page.instruction_edit.height()
+
+    assert initial_height < grown_height
+    assert grown_height <= 220
 
     window.close()
     app.quit()
