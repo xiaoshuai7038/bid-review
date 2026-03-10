@@ -148,6 +148,12 @@ def _extract_local_file_paths_from_urls(urls: list[QUrl]) -> list[str]:
     return paths
 
 
+def _enable_drop_passthrough(container: QWidget, *widgets: QWidget) -> None:
+    for widget in widgets:
+        widget.setAcceptDrops(True)
+        widget.installEventFilter(container)
+
+
 class AutoResizingPlainTextEdit(QPlainTextEdit):
     def __init__(
         self,
@@ -249,8 +255,14 @@ class SingleFileDropCard(SurfaceFrame):
 
         self.browse_button.clicked.connect(self.browse)
         self.clear_button.clicked.connect(self.clear)
-        for widget in (title_label, self.hint_label, self.path_label, self.browse_button, self.clear_button):
-            widget.installEventFilter(self)
+        _enable_drop_passthrough(
+            self,
+            title_label,
+            self.hint_label,
+            self.path_label,
+            self.browse_button,
+            self.clear_button,
+        )
 
     def dragEnterEvent(self, event) -> None:  # type: ignore[override]
         if _extract_local_file_paths_from_urls(event.mimeData().urls()):
@@ -339,15 +351,16 @@ class MultiFileDropCard(SurfaceFrame):
         self.add_button.clicked.connect(self.browse)
         self.remove_button.clicked.connect(self.remove_selected)
         self.clear_button.clicked.connect(self.clear)
-        for widget in (
+        _enable_drop_passthrough(
+            self,
             title_label,
             self.count_label,
             self.list_widget,
+            self.list_widget.viewport(),
             self.add_button,
             self.remove_button,
             self.clear_button,
-        ):
-            widget.installEventFilter(self)
+        )
         self._refresh_count()
 
     def dragEnterEvent(self, event) -> None:  # type: ignore[override]

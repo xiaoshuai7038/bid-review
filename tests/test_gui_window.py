@@ -324,6 +324,9 @@ def test_single_file_drop_card_handles_windows_explorer_urls(tmp_path: Path) -> 
 
     assert handled is True
     assert card.file_path() == str(file_path.resolve())
+    assert card.acceptDrops() is True
+    assert card.path_label.acceptDrops() is True
+    assert card.browse_button.acceptDrops() is True
     card.close()
     app.quit()
 
@@ -346,5 +349,9 @@ def test_multi_file_drop_card_handles_windows_explorer_urls(tmp_path: Path) -> N
 
     assert handled is True
     assert card.paths() == [str(file_a.resolve()), str(file_b.resolve())]
+    assert card.acceptDrops() is True
+    assert card.list_widget.acceptDrops() is True
+    assert card.list_widget.viewport().acceptDrops() is True
+    assert card.add_button.acceptDrops() is True
     card.close()
     app.quit()
