@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import os
 
-from PySide6.QtCore import QDateTime, Qt, Signal, QUrl
+from PySide6.QtCore import QDateTime, QEvent, Qt, Signal, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -130,6 +130,24 @@ def _combo_value(combo: QComboBox) -> str:
     return combo.currentText().strip()
 
 
+def _extract_local_file_paths_from_urls(urls: list[QUrl]) -> list[str]:
+    paths: list[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        local = url.toLocalFile()
+        if not local:
+            continue
+        candidate = Path(local).expanduser().resolve()
+        if not candidate.is_file():
+            continue
+        normalized = str(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        paths.append(normalized)
+    return paths
+
+
 class AutoResizingPlainTextEdit(QPlainTextEdit):
     def __init__(
         self,
@@ -231,18 +249,40 @@ class SingleFileDropCard(SurfaceFrame):
 
         self.browse_button.clicked.connect(self.browse)
         self.clear_button.clicked.connect(self.clear)
+        for widget in (title_label, self.hint_label, self.path_label, self.browse_button, self.clear_button):
+            widget.installEventFilter(self)
 
     def dragEnterEvent(self, event) -> None:  # type: ignore[override]
-        if event.mimeData().hasUrls():
+        if _extract_local_file_paths_from_urls(event.mimeData().urls()):
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event) -> None:  # type: ignore[override]
+        if _extract_local_file_paths_from_urls(event.mimeData().urls()):
             event.acceptProposedAction()
 
     def dropEvent(self, event) -> None:  # type: ignore[override]
-        for url in event.mimeData().urls():
-            local = url.toLocalFile()
-            if local and Path(local).is_file():
-                self.set_file(local)
-                break
-        event.acceptProposedAction()
+        if self._handle_drop_urls(event.mimeData().urls()):
+            event.acceptProposedAction()
+
+    def eventFilter(self, watched: object, event: object) -> bool:
+        if isinstance(watched, QWidget) and hasattr(event, "type"):
+            event_type = event.type()
+            if event_type in {QEvent.DragEnter, QEvent.DragMove} and hasattr(event, "mimeData"):
+                if _extract_local_file_paths_from_urls(event.mimeData().urls()):
+                    event.acceptProposedAction()
+                    return True
+            if event_type == QEvent.Drop and hasattr(event, "mimeData"):
+                if self._handle_drop_urls(event.mimeData().urls()):
+                    event.acceptProposedAction()
+                    return True
+        return super().eventFilter(watched, event)
+
+    def _handle_drop_urls(self, urls: list[QUrl]) -> bool:
+        paths = _extract_local_file_paths_from_urls(urls)
+        if not paths:
+            return False
+        self.set_file(paths[0])
+        return True
 
     def browse(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "选择文件")
@@ -299,15 +339,48 @@ class MultiFileDropCard(SurfaceFrame):
         self.add_button.clicked.connect(self.browse)
         self.remove_button.clicked.connect(self.remove_selected)
         self.clear_button.clicked.connect(self.clear)
+        for widget in (
+            title_label,
+            self.count_label,
+            self.list_widget,
+            self.add_button,
+            self.remove_button,
+            self.clear_button,
+        ):
+            widget.installEventFilter(self)
         self._refresh_count()
 
     def dragEnterEvent(self, event) -> None:  # type: ignore[override]
-        if event.mimeData().hasUrls():
+        if _extract_local_file_paths_from_urls(event.mimeData().urls()):
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event) -> None:  # type: ignore[override]
+        if _extract_local_file_paths_from_urls(event.mimeData().urls()):
             event.acceptProposedAction()
 
     def dropEvent(self, event) -> None:  # type: ignore[override]
-        self.add_paths([url.toLocalFile() for url in event.mimeData().urls()])
-        event.acceptProposedAction()
+        if self._handle_drop_urls(event.mimeData().urls()):
+            event.acceptProposedAction()
+
+    def eventFilter(self, watched: object, event: object) -> bool:
+        if isinstance(watched, QWidget) and hasattr(event, "type"):
+            event_type = event.type()
+            if event_type in {QEvent.DragEnter, QEvent.DragMove} and hasattr(event, "mimeData"):
+                if _extract_local_file_paths_from_urls(event.mimeData().urls()):
+                    event.acceptProposedAction()
+                    return True
+            if event_type == QEvent.Drop and hasattr(event, "mimeData"):
+                if self._handle_drop_urls(event.mimeData().urls()):
+                    event.acceptProposedAction()
+                    return True
+        return super().eventFilter(watched, event)
+
+    def _handle_drop_urls(self, urls: list[QUrl]) -> bool:
+        paths = _extract_local_file_paths_from_urls(urls)
+        if not paths:
+            return False
+        self.add_paths(paths)
+        return True
 
     def browse(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "选择投标文件")

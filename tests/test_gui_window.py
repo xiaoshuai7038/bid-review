@@ -4,10 +4,12 @@ import os
 import json
 from pathlib import Path
 
+from PySide6.QtCore import QUrl
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from app.gui.app import create_application
-from app.gui.window import MainWindow
+from app.gui.window import MainWindow, MultiFileDropCard, SingleFileDropCard
 
 
 def test_main_window_boots_with_saved_settings(tmp_path: Path, monkeypatch) -> None:
@@ -308,4 +310,41 @@ def test_review_page_instruction_editors_auto_grow_with_content(tmp_path: Path, 
     assert grown_height <= 220
 
     window.close()
+    app.quit()
+
+
+def test_single_file_drop_card_handles_windows_explorer_urls(tmp_path: Path) -> None:
+    file_path = tmp_path / "招标文件.pdf"
+    file_path.write_text("demo", encoding="utf-8")
+
+    app = create_application([])
+    card = SingleFileDropCard("招标文件", "hint")
+
+    handled = card._handle_drop_urls([QUrl.fromLocalFile(str(file_path))])
+
+    assert handled is True
+    assert card.file_path() == str(file_path.resolve())
+    card.close()
+    app.quit()
+
+
+def test_multi_file_drop_card_handles_windows_explorer_urls(tmp_path: Path) -> None:
+    file_a = tmp_path / "投标文件1.docx"
+    file_b = tmp_path / "投标文件2.docx"
+    file_a.write_text("a", encoding="utf-8")
+    file_b.write_text("b", encoding="utf-8")
+
+    app = create_application([])
+    card = MultiFileDropCard("投标文件", "hint")
+
+    handled = card._handle_drop_urls(
+        [
+            QUrl.fromLocalFile(str(file_a)),
+            QUrl.fromLocalFile(str(file_b)),
+        ]
+    )
+
+    assert handled is True
+    assert card.paths() == [str(file_a.resolve()), str(file_b.resolve())]
+    card.close()
     app.quit()
