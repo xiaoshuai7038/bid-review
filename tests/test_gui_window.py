@@ -355,3 +355,76 @@ def test_multi_file_drop_card_handles_windows_explorer_urls(tmp_path: Path) -> N
     assert card.add_button.acceptDrops() is True
     card.close()
     app.quit()
+
+
+def test_review_page_routes_viewport_drop_to_target_cards(tmp_path: Path, monkeypatch) -> None:
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "default_backend": "claude",
+                "default_output_dir": str(tmp_path / "output"),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BID_REVIEW_GUI_SETTINGS_PATH", str(settings_path))
+
+    app = create_application([])
+    window = MainWindow()
+    window.resize(1560, 980)
+    window.show()
+    window._set_current_page(1)
+    app.processEvents()
+
+    page = window.review_page
+    viewport = page.left_scroll.viewport()
+    tender_point = page.left_scroll.widget().mapTo(viewport, page.tender_card.geometry().center())
+    bid_point = page.left_scroll.widget().mapTo(viewport, page.bid_card.geometry().center())
+
+    assert page._drop_target_for_viewport_pos(tender_point) is page.tender_card
+    assert page._drop_target_for_viewport_pos(bid_point) is page.bid_card
+
+    window.close()
+    app.quit()
+
+
+def test_review_page_handles_drop_on_viewport_for_tender_and_bid(tmp_path: Path, monkeypatch) -> None:
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "default_backend": "claude",
+                "default_output_dir": str(tmp_path / "output"),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    tender_file = tmp_path / "招标文件.pdf"
+    bid_file = tmp_path / "投标文件.docx"
+    tender_file.write_text("tender", encoding="utf-8")
+    bid_file.write_text("bid", encoding="utf-8")
+    monkeypatch.setenv("BID_REVIEW_GUI_SETTINGS_PATH", str(settings_path))
+
+    app = create_application([])
+    window = MainWindow()
+    window.resize(1560, 980)
+    window.show()
+    window._set_current_page(1)
+    app.processEvents()
+
+    page = window.review_page
+    viewport = page.left_scroll.viewport()
+    tender_point = page.left_scroll.widget().mapTo(viewport, page.tender_card.geometry().center())
+    bid_point = page.left_scroll.widget().mapTo(viewport, page.bid_card.geometry().center())
+
+    assert page._handle_drop_on_viewport([QUrl.fromLocalFile(str(tender_file))], tender_point) is True
+    assert page.tender_card.file_path() == str(tender_file.resolve())
+
+    assert page._handle_drop_on_viewport([QUrl.fromLocalFile(str(bid_file))], bid_point) is True
+    assert page.bid_card.paths() == [str(bid_file.resolve())]
+
+    window.close()
+    app.quit()

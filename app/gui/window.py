@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import os
 
-from PySide6.QtCore import QDateTime, QEvent, Qt, Signal, QUrl
+from PySide6.QtCore import QDateTime, QEvent, QPoint, Qt, Signal, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -674,6 +674,8 @@ class ReviewPage(QWidget):
         self.left_scroll.setFrameShape(QFrame.NoFrame)
         self.left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.left_scroll.setWidget(left)
+        self.left_scroll.viewport().setAcceptDrops(True)
+        self.left_scroll.viewport().installEventFilter(self)
         left_container_layout.addWidget(top_actions)
         left_container_layout.addWidget(self.left_scroll, 1)
 
@@ -740,6 +742,50 @@ class ReviewPage(QWidget):
         self.output_dir_button.clicked.connect(self._browse_output_dir)
         self.open_output_button.clicked.connect(self._open_output_dir)
         self.backend_combo.currentTextChanged.connect(self._on_backend_changed)
+
+    def eventFilter(self, watched: object, event: object) -> bool:
+        if watched is self.left_scroll.viewport() and hasattr(event, "type"):
+            event_type = event.type()
+            if event_type in {QEvent.DragEnter, QEvent.DragMove} and hasattr(event, "mimeData"):
+                point = self._event_point(event)
+                if point is not None and self._drop_target_for_viewport_pos(point) is not None:
+                    if _extract_local_file_paths_from_urls(event.mimeData().urls()):
+                        event.acceptProposedAction()
+                        return True
+            if event_type == QEvent.Drop and hasattr(event, "mimeData"):
+                point = self._event_point(event)
+                if point is not None and self._handle_drop_on_viewport(event.mimeData().urls(), point):
+                    event.acceptProposedAction()
+                    return True
+        return super().eventFilter(watched, event)
+
+    def _drop_target_for_viewport_pos(self, point: QPoint) -> SingleFileDropCard | MultiFileDropCard | None:
+        content = self.left_scroll.widget()
+        if content is None:
+            return None
+        content_point = content.mapFrom(self.left_scroll.viewport(), point)
+        for card in (self.tender_card, self.bid_card):
+            if card.geometry().contains(content_point):
+                return card
+        return None
+
+    def _handle_drop_on_viewport(self, urls: list[QUrl], point: QPoint) -> bool:
+        target = self._drop_target_for_viewport_pos(point)
+        if target is None:
+            return False
+        if target is self.tender_card:
+            return self.tender_card._handle_drop_urls(urls)
+        if target is self.bid_card:
+            return self.bid_card._handle_drop_urls(urls)
+        return False
+
+    @staticmethod
+    def _event_point(event: object) -> QPoint | None:
+        if hasattr(event, "position"):
+            return event.position().toPoint()
+        if hasattr(event, "pos"):
+            return event.pos()
+        return None
 
     def load_settings(self, settings: DesktopSettings) -> None:
         self._backend_model_defaults = {
