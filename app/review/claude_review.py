@@ -6,6 +6,7 @@ import os
 import time
 import zipfile
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from docx.text.paragraph import Paragraph
 
 from app.llm.claude_client import (
     ClaudeCallError,
+    ClaudeClient,
     compact_text_for_prompt,
     extract_json_payload,
     prompt_safe_path,
@@ -88,6 +90,33 @@ _IMAGE_SUFFIXES = {
     ".tiff",
     ".gif",
 }
+
+_CLAUDE_SDK_REVIEW_TOOL_ALLOWLIST = ",".join(
+    [
+        "document-parser.read_pdf",
+        "document-parser.read_word",
+        "document-parser.extract_images_from_word",
+        "paddle-ocr.ocr_images_in_dir",
+        "paddle-ocr.ocr_pdf",
+        "Bash",
+        "Grep",
+        "Glob",
+        "TodoWrite",
+    ]
+)
+
+
+@contextmanager
+def _prefer_claude_sdk_review_tools(client: Any):
+    if not isinstance(client, ClaudeClient):
+        yield
+        return
+    original_tools = client.tools
+    client.tools = _CLAUDE_SDK_REVIEW_TOOL_ALLOWLIST
+    try:
+        yield
+    finally:
+        client.tools = original_tools
 
 _PRECISE_LOCATION_PATTERNS = (
     re.compile(r"第\d+页\s*L\d+(?:-L\d+)?"),
@@ -2169,114 +2198,115 @@ def run_bid_review_with_claude(
     if ocr_required and require_word_extract and client.timeout_sec < 7200:
         client.timeout_sec = 7200
     try:
-        prompt = _append_no_write_enforcement(prompt)
-        raw_output = client.ask_text(prompt, task_label=f"初审：{bid_path_obj.name}")
-        first_guard = _collect_review_guard_state(
-            tool_calls=client.get_last_tool_calls(),
-            tool_uses=client.get_last_tool_uses(),
-            ocr_required=ocr_required,
-            require_word_extract=require_word_extract,
-            bid_path=bid_path_obj,
-        )
-        need_retry = bool(first_guard.get("has_forbidden_write", False)) or not bool(first_guard.get("ocr_guard_ok", True))
-        if need_retry:
-            retry_prompt = prompt
-            if not bool(first_guard.get("ocr_guard_ok", True)):
-                retry_prompt = _append_ocr_enforcement(retry_prompt, require_word_extract=require_word_extract)
-            if require_word_extract and not bool(first_guard.get("word_ocr_coverage_ok", True)):
-                retry_prompt = (
-                    retry_prompt
-                    + "\n你上一次未完成 Word 提图全量 OCR。"
-                    + str(first_guard.get("word_ocr_coverage_detail", ""))
-                    + "请严格覆盖提图目录中的全部图片。"
-                )
-            if bool(first_guard.get("has_forbidden_write", False)):
-                retry_prompt = _append_no_write_enforcement(retry_prompt)
-            retry_output = client.ask_text(retry_prompt, task_label=f"初审重试(约束强制)：{bid_path_obj.name}")
-            retry_guard = _collect_review_guard_state(
+        with _prefer_claude_sdk_review_tools(client):
+            prompt = _append_no_write_enforcement(prompt)
+            raw_output = client.ask_text(prompt, task_label=f"初审：{bid_path_obj.name}")
+            first_guard = _collect_review_guard_state(
                 tool_calls=client.get_last_tool_calls(),
                 tool_uses=client.get_last_tool_uses(),
                 ocr_required=ocr_required,
                 require_word_extract=require_word_extract,
                 bid_path=bid_path_obj,
             )
-            missing_requirements = [str(x) for x in retry_guard.get("missing_requirements", [])]
-            if missing_requirements:
-                raise ClaudeCallError(
-                    f"审查阶段缺少必要MCP调用（{', '.join(missing_requirements)}），已按强制规则重试1次仍失败。"
+            need_retry = bool(first_guard.get("has_forbidden_write", False)) or not bool(first_guard.get("ocr_guard_ok", True))
+            if need_retry:
+                retry_prompt = prompt
+                if not bool(first_guard.get("ocr_guard_ok", True)):
+                    retry_prompt = _append_ocr_enforcement(retry_prompt, require_word_extract=require_word_extract)
+                if require_word_extract and not bool(first_guard.get("word_ocr_coverage_ok", True)):
+                    retry_prompt = (
+                        retry_prompt
+                        + "\n你上一次未完成 Word 提图全量 OCR。"
+                        + str(first_guard.get("word_ocr_coverage_detail", ""))
+                        + "请严格覆盖提图目录中的全部图片。"
+                    )
+                if bool(first_guard.get("has_forbidden_write", False)):
+                    retry_prompt = _append_no_write_enforcement(retry_prompt)
+                retry_output = client.ask_text(retry_prompt, task_label=f"初审重试(约束强制)：{bid_path_obj.name}")
+                retry_guard = _collect_review_guard_state(
+                    tool_calls=client.get_last_tool_calls(),
+                    tool_uses=client.get_last_tool_uses(),
+                    ocr_required=ocr_required,
+                    require_word_extract=require_word_extract,
+                    bid_path=bid_path_obj,
                 )
-            if require_word_extract and not bool(retry_guard.get("word_ocr_coverage_ok", True)):
+                missing_requirements = [str(x) for x in retry_guard.get("missing_requirements", [])]
+                if missing_requirements:
+                    raise ClaudeCallError(
+                        f"审查阶段缺少必要MCP调用（{', '.join(missing_requirements)}），已按强制规则重试1次仍失败。"
+                    )
+                if require_word_extract and not bool(retry_guard.get("word_ocr_coverage_ok", True)):
+                    raise ClaudeCallError(
+                        "Word图片OCR未全量覆盖，已按强制规则重试1次仍失败。"
+                        + str(retry_guard.get("word_ocr_coverage_detail", ""))
+                    )
+                if bool(retry_guard.get("has_forbidden_write", False)) and _strict_fail_on_forbidden_write():
+                    raise ClaudeCallError("审查阶段检测到写文件/脚本执行行为，已按只读规则重试1次仍失败。")
+                raw_output = retry_output
+                active_guard = retry_guard
+            else:
+                active_guard = first_guard
+            if require_word_extract and not bool(active_guard.get("word_ocr_coverage_ok", True)):
                 raise ClaudeCallError(
-                    "Word图片OCR未全量覆盖，已按强制规则重试1次仍失败。"
-                    + str(retry_guard.get("word_ocr_coverage_detail", ""))
+                    "Word图片OCR未全量覆盖。"
+                    + str(active_guard.get("word_ocr_coverage_detail", ""))
                 )
-            if bool(retry_guard.get("has_forbidden_write", False)) and _strict_fail_on_forbidden_write():
-                raise ClaudeCallError("审查阶段检测到写文件/脚本执行行为，已按只读规则重试1次仍失败。")
-            raw_output = retry_output
-            active_guard = retry_guard
-        else:
-            active_guard = first_guard
-        if require_word_extract and not bool(active_guard.get("word_ocr_coverage_ok", True)):
-            raise ClaudeCallError(
-                "Word图片OCR未全量覆盖。"
-                + str(active_guard.get("word_ocr_coverage_detail", ""))
-            )
-        if ocr_required and require_word_extract:
-            word_ocr_fully_covered = bool(active_guard.get("word_ocr_coverage_ok", True))
-        report, raw_output = _parse_review_report_from_raw(
-            raw_output=raw_output,
-            prompt=prompt,
-            client=client,
-            backend_name=backend_name,
-            tender_path=tender_path_obj,
-            bid_path=bid_path_obj,
-        )
-        location_gaps = _find_precise_location_gaps(report, bid_path=bid_path_obj)
-        if location_gaps:
-            location_retry_prompt = _append_precise_location_enforcement(
-                prompt,
-                bid_path=bid_path_obj,
-                gaps=location_gaps,
-            )
-            location_retry_raw = client.ask_text(
-                location_retry_prompt,
-                task_label=f"初审重试(精确定位)：{bid_path_obj.name}",
-            )
-            retry_report, location_retry_raw = _parse_review_report_from_raw(
-                raw_output=location_retry_raw,
-                prompt=location_retry_prompt,
+            if ocr_required and require_word_extract:
+                word_ocr_fully_covered = bool(active_guard.get("word_ocr_coverage_ok", True))
+            report, raw_output = _parse_review_report_from_raw(
+                raw_output=raw_output,
+                prompt=prompt,
                 client=client,
                 backend_name=backend_name,
                 tender_path=tender_path_obj,
                 bid_path=bid_path_obj,
             )
-            location_retry_guard = _collect_review_guard_state(
-                tool_calls=client.get_last_tool_calls(),
-                tool_uses=client.get_last_tool_uses(),
-                ocr_required=ocr_required,
-                require_word_extract=require_word_extract,
-                bid_path=bid_path_obj,
-            )
-            location_retry_failures = _describe_review_guard_failures(
-                location_retry_guard,
-                ocr_required=ocr_required,
-                require_word_extract=require_word_extract,
-            )
-            if bool(location_retry_guard.get("has_forbidden_write", False)) and _strict_fail_on_forbidden_write():
-                raise ClaudeCallError("精确定位重试阶段检测到写文件/脚本执行行为，已按只读规则跳过采纳。")
-            if location_retry_failures:
-                raw_output = (
-                    f"{raw_output}\n\n[LOCATION_RETRY_SKIPPED]\n"
-                    + "；".join(location_retry_failures)
-                    + f"\n{location_retry_raw}"
+            location_gaps = _find_precise_location_gaps(report, bid_path=bid_path_obj)
+            if location_gaps:
+                location_retry_prompt = _append_precise_location_enforcement(
+                    prompt,
+                    bid_path=bid_path_obj,
+                    gaps=location_gaps,
                 )
-            else:
-                merged_report, merged = _merge_precise_location_retry_report(report, retry_report)
-                if merged:
-                    report = merged_report
-                    raw_output = f"{raw_output}\n\n[LOCATION_RETRY]\n{location_retry_raw}"
+                location_retry_raw = client.ask_text(
+                    location_retry_prompt,
+                    task_label=f"初审重试(精确定位)：{bid_path_obj.name}",
+                )
+                retry_report, location_retry_raw = _parse_review_report_from_raw(
+                    raw_output=location_retry_raw,
+                    prompt=location_retry_prompt,
+                    client=client,
+                    backend_name=backend_name,
+                    tender_path=tender_path_obj,
+                    bid_path=bid_path_obj,
+                )
+                location_retry_guard = _collect_review_guard_state(
+                    tool_calls=client.get_last_tool_calls(),
+                    tool_uses=client.get_last_tool_uses(),
+                    ocr_required=ocr_required,
+                    require_word_extract=require_word_extract,
+                    bid_path=bid_path_obj,
+                )
+                location_retry_failures = _describe_review_guard_failures(
+                    location_retry_guard,
+                    ocr_required=ocr_required,
+                    require_word_extract=require_word_extract,
+                )
+                if bool(location_retry_guard.get("has_forbidden_write", False)) and _strict_fail_on_forbidden_write():
+                    raise ClaudeCallError("精确定位重试阶段检测到写文件/脚本执行行为，已按只读规则跳过采纳。")
+                if location_retry_failures:
+                    raw_output = (
+                        f"{raw_output}\n\n[LOCATION_RETRY_SKIPPED]\n"
+                        + "；".join(location_retry_failures)
+                        + f"\n{location_retry_raw}"
+                    )
                 else:
-                    raw_output = f"{raw_output}\n\n[LOCATION_RETRY_SKIPPED]\n{location_retry_raw}"
+                    merged_report, merged = _merge_precise_location_retry_report(report, retry_report)
+                    if merged:
+                        report = merged_report
+                        raw_output = f"{raw_output}\n\n[LOCATION_RETRY]\n{location_retry_raw}"
+                    else:
+                        raw_output = f"{raw_output}\n\n[LOCATION_RETRY_SKIPPED]\n{location_retry_raw}"
     finally:
         client.timeout_sec = original_timeout
 
@@ -2309,13 +2339,14 @@ def run_bid_review_with_claude(
         user_instruction=user_ins,
         initial_json=initial_json,
     )
-    second_prompt = _append_no_write_enforcement(second_prompt)
-    second_raw = client.ask_text(second_prompt, task_label=f"二次复核：{bid_path_obj.name}")
-    if _has_forbidden_write_tool_call(client.get_last_tool_uses()):
-        second_retry = _append_no_write_enforcement(second_prompt)
-        second_raw = client.ask_text(second_retry, task_label=f"二次复核重试(只读强制)：{bid_path_obj.name}")
-        if _has_forbidden_write_tool_call(client.get_last_tool_uses()) and _strict_fail_on_forbidden_write():
-            raise ClaudeCallError("二次复核阶段检测到写文件/脚本执行行为，已按只读规则重试1次仍失败。")
+    with _prefer_claude_sdk_review_tools(client):
+        second_prompt = _append_no_write_enforcement(second_prompt)
+        second_raw = client.ask_text(second_prompt, task_label=f"二次复核：{bid_path_obj.name}")
+        if _has_forbidden_write_tool_call(client.get_last_tool_uses()):
+            second_retry = _append_no_write_enforcement(second_prompt)
+            second_raw = client.ask_text(second_retry, task_label=f"二次复核重试(只读强制)：{bid_path_obj.name}")
+            if _has_forbidden_write_tool_call(client.get_last_tool_uses()) and _strict_fail_on_forbidden_write():
+                raise ClaudeCallError("二次复核阶段检测到写文件/脚本执行行为，已按只读规则重试1次仍失败。")
     try:
         second_data = extract_json_payload(second_raw)
         add_findings = _normalize_findings(second_data.get("additional_findings", []))
