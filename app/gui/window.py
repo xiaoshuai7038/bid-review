@@ -25,11 +25,13 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStackedWidget,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
     QHeaderView,
+    QSizePolicy,
 )
 
 from app.gui.services import (
@@ -67,6 +69,20 @@ def _status_text(status: str) -> str:
         "needs_manual": "需人工复核",
     }
     return mapping.get(status, status or "")
+
+
+def _pin_form_field_height(widget: QWidget, min_height: int = 40) -> None:
+    widget.setMinimumHeight(min_height)
+    widget.setSizePolicy(widget.sizePolicy().horizontalPolicy(), QSizePolicy.Fixed)
+
+
+def _configure_form_layout(form: QFormLayout) -> None:
+    form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+    form.setRowWrapPolicy(QFormLayout.DontWrapRows)
+    form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+    form.setFormAlignment(Qt.AlignTop)
+    form.setHorizontalSpacing(14)
+    form.setVerticalSpacing(12)
 
 
 class SurfaceFrame(QFrame):
@@ -359,6 +375,7 @@ class ReviewPage(QWidget):
         splitter.setChildrenCollapsible(False)
 
         left = QWidget()
+        left.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(18)
@@ -394,17 +411,29 @@ class ReviewPage(QWidget):
         self.save_raw_checkbox.setChecked(True)
 
         form = QFormLayout()
-        form.setHorizontalSpacing(14)
-        form.setVerticalSpacing(12)
+        _configure_form_layout(form)
+
+        _pin_form_field_height(self.backend_combo)
+        _pin_form_field_height(self.model_edit)
+        _pin_form_field_height(self.progress_combo)
+        _pin_form_field_height(self.output_dir_edit)
+        _pin_form_field_height(self.timeout_spin)
+        _pin_form_field_height(self.effort_combo)
+        self.output_dir_button.setMinimumHeight(40)
+        self.output_dir_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
         form.addRow("后端", self.backend_combo)
         form.addRow("模型", self.model_edit)
         form.addRow("进度级别", self.progress_combo)
 
         output_row = QHBoxLayout()
+        output_row.setContentsMargins(0, 0, 0, 0)
         output_row.setSpacing(8)
         output_row.addWidget(self.output_dir_edit, 1)
         output_row.addWidget(self.output_dir_button)
         output_wrap = QWidget()
+        output_wrap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        output_wrap.setMinimumHeight(40)
         output_wrap.setLayout(output_row)
         form.addRow("输出目录", output_wrap)
         form.addRow("超时（秒）", self.timeout_spin)
@@ -423,8 +452,10 @@ class ReviewPage(QWidget):
         instruction_note = QLabel("这里传入的是现有 CLI 的 `--instruction` 与 `--user-instruction`。")
         instruction_note.setObjectName("MutedLabel")
         self.instruction_edit = QPlainTextEdit()
+        self.instruction_edit.setMinimumHeight(78)
         self.instruction_edit.setPlaceholderText("附加任务指令")
         self.user_instruction_edit = QPlainTextEdit()
+        self.user_instruction_edit.setMinimumHeight(78)
         self.user_instruction_edit.setPlaceholderText("用户个人指令")
         instruction_layout.addWidget(instruction_title)
         instruction_layout.addWidget(instruction_note)
@@ -450,8 +481,15 @@ class ReviewPage(QWidget):
 
         left_layout.addLayout(file_row)
         left_layout.addWidget(config_card)
-        left_layout.addWidget(instruction_card, 1)
+        left_layout.addWidget(instruction_card)
         left_layout.addWidget(action_card)
+        left_layout.addStretch(1)
+
+        self.left_scroll = QScrollArea()
+        self.left_scroll.setWidgetResizable(True)
+        self.left_scroll.setFrameShape(QFrame.NoFrame)
+        self.left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.left_scroll.setWidget(left)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
@@ -505,7 +543,7 @@ class ReviewPage(QWidget):
         right_layout.addWidget(timeline_card, 1)
         right_layout.addWidget(log_card, 2)
 
-        splitter.addWidget(left)
+        splitter.addWidget(self.left_scroll)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 5)
         splitter.setStretchFactor(1, 4)
@@ -778,6 +816,12 @@ class SettingsPage(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(18)
 
+        content = QWidget()
+        content.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(18)
+
         toolchain = SurfaceFrame("card")
         toolchain_layout = QVBoxLayout(toolchain)
         toolchain_layout.setContentsMargins(24, 20, 24, 20)
@@ -788,6 +832,7 @@ class SettingsPage(QWidget):
         self.default_backend = QComboBox()
         self.default_backend.addItems(["claude", "opencode"])
         self.default_model = QLineEdit()
+        self.default_model.setPlaceholderText("Claude SDK 默认读取 ANTHROPIC_MODEL")
         self.default_progress = QComboBox()
         self.default_progress.addItems(["agent", "basic", "normal", "detailed", "events", "raw"])
         self.default_timeout = QSpinBox()
@@ -795,6 +840,11 @@ class SettingsPage(QWidget):
         self.default_timeout.setSingleStep(60)
         self.default_effort = QComboBox()
         self.default_effort.addItems(["low", "medium", "high"])
+        self.claude_sdk_base_url = QLineEdit()
+        self.claude_sdk_base_url.setPlaceholderText("https://ark.cn-beijing.volces.com/api/coding")
+        self.claude_sdk_auth_token = QLineEdit()
+        self.claude_sdk_auth_token.setEchoMode(QLineEdit.Password)
+        self.claude_sdk_auth_token.setPlaceholderText("仅当前窗口会话使用，不写入 settings.json")
         self.output_dir = QLineEdit()
         self.claude_bin = QLineEdit()
         self.opencode_bin = QLineEdit()
@@ -805,10 +855,24 @@ class SettingsPage(QWidget):
         self.opencode_api_key.setPlaceholderText("仅当前窗口会话使用，不写入 settings.json")
 
         form = QFormLayout()
-        form.setHorizontalSpacing(14)
-        form.setVerticalSpacing(12)
+        _configure_form_layout(form)
+        _pin_form_field_height(self.default_backend)
+        _pin_form_field_height(self.default_model)
+        _pin_form_field_height(self.default_progress)
+        _pin_form_field_height(self.default_timeout)
+        _pin_form_field_height(self.default_effort)
+        _pin_form_field_height(self.claude_sdk_base_url)
+        _pin_form_field_height(self.claude_sdk_auth_token)
+        _pin_form_field_height(self.output_dir)
+        _pin_form_field_height(self.claude_bin)
+        _pin_form_field_height(self.opencode_bin)
+        _pin_form_field_height(self.opencode_provider)
+        _pin_form_field_height(self.opencode_api_url)
+        _pin_form_field_height(self.opencode_api_key)
         form.addRow("默认后端", self.default_backend)
         form.addRow("默认模型", self.default_model)
+        form.addRow("Claude SDK base-url", self.claude_sdk_base_url)
+        form.addRow("Claude SDK auth-token", self.claude_sdk_auth_token)
         form.addRow("默认进度级别", self.default_progress)
         form.addRow("默认超时（秒）", self.default_timeout)
         form.addRow("默认 Claude effort", self.default_effort)
@@ -821,7 +885,9 @@ class SettingsPage(QWidget):
         toolchain_layout.addWidget(toolchain_title)
         toolchain_layout.addLayout(form)
 
-        guidance = QLabel("provider 与 api-url 会保存到本地设置；api-key 只保留在当前窗口内存。")
+        guidance = QLabel(
+            "Claude SDK base-url 会保存到本地设置；Claude auth-token 与 OpenCode api-key 只保留在当前窗口内存。"
+        )
         guidance.setObjectName("MutedLabel")
         toolchain_layout.addWidget(guidance)
 
@@ -832,8 +898,10 @@ class SettingsPage(QWidget):
         instruction_title = QLabel("默认补充指令")
         instruction_title.setObjectName("SectionTitle")
         self.default_instruction = QPlainTextEdit()
+        self.default_instruction.setMinimumHeight(120)
         self.default_instruction.setPlaceholderText("默认 --instruction")
         self.default_user_instruction = QPlainTextEdit()
+        self.default_user_instruction.setMinimumHeight(120)
         self.default_user_instruction.setPlaceholderText("默认 --user-instruction")
         instruction_layout.addWidget(instruction_title)
         instruction_layout.addWidget(self.default_instruction)
@@ -845,15 +913,31 @@ class SettingsPage(QWidget):
         action_row.addWidget(self.save_button)
         action_row.addStretch(1)
 
-        layout.addWidget(toolchain)
-        layout.addWidget(instruction_card, 1)
-        layout.addLayout(action_row)
+        content_layout.addWidget(toolchain)
+        content_layout.addWidget(instruction_card)
+        content_layout.addLayout(action_row)
+        content_layout.addStretch(1)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setWidget(content)
+
+        layout.addWidget(self.scroll, 1)
 
         self.save_button.clicked.connect(self.save_requested.emit)
 
-    def load_settings(self, settings: DesktopSettings, session_api_key: str = "") -> None:
+    def load_settings(
+        self,
+        settings: DesktopSettings,
+        session_api_key: str = "",
+        session_claude_auth_token: str = "",
+    ) -> None:
         self.default_backend.setCurrentText(settings.default_backend or "claude")
         self.default_model.setText(settings.default_model)
+        self.claude_sdk_base_url.setText(settings.claude_sdk_base_url)
+        self.claude_sdk_auth_token.setText(session_claude_auth_token)
         self.default_progress.setCurrentText(settings.default_progress_level or "agent")
         self.default_timeout.setValue(settings.default_timeout_sec or 1800)
         self.default_effort.setCurrentText(settings.default_effort or "low")
@@ -876,6 +960,7 @@ class SettingsPage(QWidget):
             default_effort=self.default_effort.currentText().strip(),
             default_instruction=self.default_instruction.toPlainText().strip(),
             default_user_instruction=self.default_user_instruction.toPlainText().strip(),
+            claude_sdk_base_url=self.claude_sdk_base_url.text().strip(),
             claude_bin=self.claude_bin.text().strip(),
             opencode_bin=self.opencode_bin.text().strip(),
             opencode_provider=self.opencode_provider.text().strip() or "volcengine",
@@ -887,15 +972,22 @@ class SettingsPage(QWidget):
     def session_api_key(self) -> str:
         return self.opencode_api_key.text().strip()
 
+    def session_claude_auth_token(self) -> str:
+        return self.claude_sdk_auth_token.text().strip()
+
     def _path_row(self, line_edit: QLineEdit, browse_callback) -> QWidget:
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
         button = QPushButton("浏览")
+        button.setMinimumHeight(40)
+        button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         button.clicked.connect(browse_callback)
         layout.addWidget(line_edit, 1)
         layout.addWidget(button)
+        row.setMinimumHeight(40)
+        row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         return row
 
     def _browse_output_dir(self) -> None:
@@ -925,6 +1017,7 @@ class MainWindow(QMainWindow):
 
         self.store = SettingsStore()
         self.settings = self.store.load()
+        self.session_claude_auth_token = os.getenv("ANTHROPIC_AUTH_TOKEN") or os.getenv("ANTHROPIC_API_KEY", "")
         self.session_api_key = os.getenv("BID_REVIEW_OPENCODE_API_KEY") or os.getenv("OPENCODE_API_KEY", "")
         self.current_result: BatchReviewData | None = None
 
@@ -937,6 +1030,7 @@ class MainWindow(QMainWindow):
         root.addWidget(self._build_nav())
         root.addWidget(self._build_content(), 1)
 
+        self._apply_claude_sdk_env()
         self._apply_settings_to_pages()
         self._load_recent_result()
         self._set_current_page(0)
@@ -1025,7 +1119,23 @@ class MainWindow(QMainWindow):
 
     def _apply_settings_to_pages(self) -> None:
         self.review_page.load_settings(self.settings)
-        self.settings_page.load_settings(self.settings, self.session_api_key)
+        self.settings_page.load_settings(self.settings, self.session_api_key, self.session_claude_auth_token)
+
+    def _apply_claude_sdk_env(self) -> None:
+        env_mapping = {
+            "ANTHROPIC_BASE_URL": self.settings.claude_sdk_base_url.strip(),
+            "ANTHROPIC_MODEL": self.settings.default_model.strip(),
+            "ANTHROPIC_AUTH_TOKEN": self.session_claude_auth_token.strip(),
+        }
+        for key, value in env_mapping.items():
+            if value:
+                os.environ[key] = value
+            else:
+                os.environ.pop(key, None)
+        if env_mapping["ANTHROPIC_AUTH_TOKEN"]:
+            os.environ["ANTHROPIC_API_KEY"] = env_mapping["ANTHROPIC_AUTH_TOKEN"]
+        else:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
 
     def _set_current_page(self, index: int) -> None:
         page_meta = {
@@ -1044,6 +1154,8 @@ class MainWindow(QMainWindow):
     def _save_settings(self) -> None:
         self.settings = self.settings_page.snapshot(self.settings)
         self.session_api_key = self.settings_page.session_api_key()
+        self.session_claude_auth_token = self.settings_page.session_claude_auth_token()
+        self._apply_claude_sdk_env()
         self.store.save(self.settings)
         self.review_page.load_settings(self.settings)
         self.status_badge.setText("设置已保存")
@@ -1086,6 +1198,7 @@ class MainWindow(QMainWindow):
         self.review_page.set_running(True)
         self.status_badge.setText("运行中")
         self._set_current_page(1)
+        self._apply_claude_sdk_env()
 
         self._worker = ReviewWorker(request, self)
         self._worker.progress.connect(self._on_progress)

@@ -49,12 +49,13 @@ def _settings_path() -> Path:
 class DesktopSettings:
     default_backend: str = "claude"
     default_output_dir: str = field(default_factory=_default_output_dir)
-    default_model: str = ""
+    default_model: str = field(default_factory=lambda: os.getenv("ANTHROPIC_MODEL", ""))
     default_progress_level: str = "agent"
     default_timeout_sec: int = 1800
     default_effort: str = "low"
     default_instruction: str = ""
     default_user_instruction: str = ""
+    claude_sdk_base_url: str = field(default_factory=lambda: os.getenv("ANTHROPIC_BASE_URL", ""))
     claude_bin: str = field(default_factory=lambda: os.getenv("CLAUDE_BIN", ""))
     opencode_bin: str = field(default_factory=lambda: os.getenv("OPENCODE_BIN", ""))
     opencode_provider: str = field(default_factory=lambda: os.getenv("BID_REVIEW_OPENCODE_PROVIDER", "volcengine"))

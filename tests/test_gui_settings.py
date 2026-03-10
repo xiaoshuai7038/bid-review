@@ -17,6 +17,7 @@ def test_settings_store_round_trip(tmp_path: Path) -> None:
         default_effort="medium",
         default_instruction="附加任务",
         default_user_instruction="个人偏好",
+        claude_sdk_base_url="https://ark.cn-beijing.volces.com/api/coding",
         claude_bin=r"C:\tools\claude.cmd",
         opencode_bin=r"C:\tools\opencode.exe",
         opencode_provider="volcengine",
@@ -29,4 +30,14 @@ def test_settings_store_round_trip(tmp_path: Path) -> None:
     loaded = store.load()
 
     assert loaded == settings
+
+
+def test_settings_defaults_pick_up_claude_sdk_env(monkeypatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "ark-code-latest")
+
+    settings = DesktopSettings()
+
+    assert settings.claude_sdk_base_url == "https://ark.cn-beijing.volces.com/api/coding"
+    assert settings.default_model == "ark-code-latest"
 
