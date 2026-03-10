@@ -71,6 +71,16 @@ def _status_text(status: str) -> str:
     return mapping.get(status, status or "")
 
 
+PROGRESS_LEVEL_ITEMS: list[tuple[str, str]] = [
+    ("简洁（推荐）", "agent"),
+    ("只看开始和结束", "basic"),
+    ("查看主要步骤", "normal"),
+    ("查看详细步骤", "detailed"),
+    ("尽量多看过程", "events"),
+    ("全部过程都显示", "raw"),
+]
+
+
 def _pin_form_field_height(widget: QWidget, min_height: int = 40) -> None:
     widget.setMinimumHeight(min_height)
     widget.setSizePolicy(widget.sizePolicy().horizontalPolicy(), QSizePolicy.Fixed)
@@ -83,6 +93,29 @@ def _configure_form_layout(form: QFormLayout) -> None:
     form.setFormAlignment(Qt.AlignTop)
     form.setHorizontalSpacing(14)
     form.setVerticalSpacing(12)
+
+
+def _populate_progress_level_combo(combo: QComboBox) -> None:
+    combo.clear()
+    for label, value in PROGRESS_LEVEL_ITEMS:
+        combo.addItem(label, value)
+
+
+def _set_combo_value(combo: QComboBox, value: str) -> None:
+    target = (value or "").strip()
+    for index in range(combo.count()):
+        if str(combo.itemData(index) or "").strip() == target:
+            combo.setCurrentIndex(index)
+            return
+    if combo.count() > 0:
+        combo.setCurrentIndex(0)
+
+
+def _combo_value(combo: QComboBox) -> str:
+    data = combo.currentData()
+    if data is not None:
+        return str(data).strip()
+    return combo.currentText().strip()
 
 
 class SurfaceFrame(QFrame):
@@ -401,7 +434,7 @@ class ReviewPage(QWidget):
         self.model_edit = QLineEdit()
         self.model_edit.setPlaceholderText("可选，覆盖默认模型")
         self.progress_combo = QComboBox()
-        self.progress_combo.addItems(["agent", "basic", "normal", "detailed", "events", "raw"])
+        _populate_progress_level_combo(self.progress_combo)
         self.output_dir_edit = QLineEdit()
         self.output_dir_button = QPushButton("浏览")
         self.timeout_spin = QSpinBox()
@@ -569,7 +602,7 @@ class ReviewPage(QWidget):
         self.backend_combo.blockSignals(False)
         self.model_edit.setText(self._backend_model_defaults.get(backend, ""))
         self._update_model_placeholder(backend)
-        self.progress_combo.setCurrentText(settings.default_progress_level or "agent")
+        _set_combo_value(self.progress_combo, settings.default_progress_level or "agent")
         self.output_dir_edit.setText(settings.default_output_dir)
         self.timeout_spin.setValue(settings.default_timeout_sec or 1800)
         self.effort_combo.setCurrentText(settings.default_effort or "low")
@@ -588,7 +621,7 @@ class ReviewPage(QWidget):
             opencode_provider=settings.opencode_provider.strip() or "volcengine",
             opencode_api_url=settings.opencode_api_url.strip(),
             opencode_api_key=session_api_key.strip(),
-            progress_level=self.progress_combo.currentText().strip(),
+            progress_level=_combo_value(self.progress_combo),
             timeout_sec=self.timeout_spin.value(),
             effort=self.effort_combo.currentText().strip(),
             instruction=self.instruction_edit.toPlainText().strip(),
@@ -860,7 +893,7 @@ class SettingsPage(QWidget):
         self.default_backend = QComboBox()
         self.default_backend.addItems(["claude", "opencode"])
         self.default_progress = QComboBox()
-        self.default_progress.addItems(["agent", "basic", "normal", "detailed", "events", "raw"])
+        _populate_progress_level_combo(self.default_progress)
         self.default_timeout = QSpinBox()
         self.default_timeout.setRange(60, 7200)
         self.default_timeout.setSingleStep(60)
@@ -1023,7 +1056,7 @@ class SettingsPage(QWidget):
         self.opencode_default_model.setText(settings.model_for_backend("opencode"))
         self.claude_sdk_base_url.setText(settings.claude_sdk_base_url)
         self.claude_sdk_auth_token.setText(session_claude_auth_token)
-        self.default_progress.setCurrentText(settings.default_progress_level or "agent")
+        _set_combo_value(self.default_progress, settings.default_progress_level or "agent")
         self.default_timeout.setValue(settings.default_timeout_sec or 1800)
         self.default_effort.setCurrentText(settings.default_effort or "low")
         self.output_dir.setText(settings.default_output_dir)
@@ -1046,7 +1079,7 @@ class SettingsPage(QWidget):
             default_model=claude_model if backend == "claude" else opencode_model,
             claude_default_model=claude_model,
             opencode_default_model=opencode_model,
-            default_progress_level=self.default_progress.currentText().strip(),
+            default_progress_level=_combo_value(self.default_progress),
             default_timeout_sec=self.default_timeout.value(),
             default_effort=self.default_effort.currentText().strip(),
             default_instruction=self.default_instruction.toPlainText().strip(),

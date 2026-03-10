@@ -98,6 +98,8 @@ def test_review_page_form_controls_keep_usable_height(tmp_path: Path, monkeypatc
     assert page.model_edit.height() >= 34
     assert page.model_edit.text() == "ark-code-latest"
     assert page.progress_combo.height() >= 34
+    assert page.progress_combo.currentText() == "简洁（推荐）"
+    assert page.progress_combo.currentData() == "agent"
     assert page.output_dir_edit.height() >= 34
     assert page.timeout_spin.height() >= 34
     assert page.effort_combo.height() >= 34
@@ -137,6 +139,8 @@ def test_settings_page_form_controls_keep_usable_height(tmp_path: Path, monkeypa
 
     page = window.settings_page
     assert page.default_backend.height() >= 34
+    assert page.default_progress.currentText() == "简洁（推荐）"
+    assert page.default_progress.currentData() == "agent"
     assert page.claude_default_model.height() >= 34
     assert page.opencode_default_model.height() >= 34
     assert page.claude_sdk_base_url.height() >= 34
@@ -196,6 +200,38 @@ def test_review_page_switches_default_model_with_backend(tmp_path: Path, monkeyp
     page.backend_combo.setCurrentText("opencode")
     app.processEvents()
     assert page.model_edit.text() == "DeepSeek-V3.2"
+
+    window.close()
+    app.quit()
+
+
+def test_progress_level_combo_uses_chinese_labels_but_keeps_internal_values(tmp_path: Path, monkeypatch) -> None:
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "default_backend": "claude",
+                "default_output_dir": str(tmp_path / "output"),
+                "default_progress_level": "detailed",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BID_REVIEW_GUI_SETTINGS_PATH", str(settings_path))
+
+    app = create_application([])
+    window = MainWindow()
+    window.show()
+    window._set_current_page(1)
+    app.processEvents()
+
+    review_page = window.review_page
+    settings_page = window.settings_page
+    assert review_page.progress_combo.currentText() == "查看详细步骤"
+    assert review_page.progress_combo.currentData() == "detailed"
+    assert settings_page.default_progress.currentText() == "查看详细步骤"
+    assert settings_page.default_progress.currentData() == "detailed"
 
     window.close()
     app.quit()
