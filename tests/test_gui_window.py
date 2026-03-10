@@ -145,13 +145,18 @@ def test_settings_page_form_controls_keep_usable_height(tmp_path: Path, monkeypa
     assert page.default_timeout.height() >= 34
     assert page.default_effort.height() >= 34
     assert page.output_dir.height() >= 34
-    assert page.claude_bin.height() >= 34
+    assert not page.claude_advanced_panel.isVisible()
     assert page.opencode_bin.height() >= 34
     assert page.opencode_provider.height() >= 34
     assert page.opencode_api_url.height() >= 34
     assert page.opencode_api_key.height() >= 34
     assert page.scroll.widget() is not None
     assert page.backend_stack.currentIndex() == 0
+
+    page.claude_advanced_toggle.click()
+    app.processEvents()
+    assert page.claude_advanced_panel.isVisible()
+    assert page.claude_bin.height() >= 34
 
     page.default_backend.setCurrentText("opencode")
     app.processEvents()

@@ -907,7 +907,7 @@ class SettingsPage(QWidget):
         claude_page = QWidget()
         claude_layout = QVBoxLayout(claude_page)
         claude_layout.setContentsMargins(0, 0, 0, 0)
-        claude_layout.setSpacing(0)
+        claude_layout.setSpacing(10)
         claude_form = QFormLayout()
         _configure_form_layout(claude_form)
         _pin_form_field_height(self.claude_default_model)
@@ -919,8 +919,25 @@ class SettingsPage(QWidget):
         claude_form.addRow("Claude SDK base-url", self.claude_sdk_base_url)
         claude_form.addRow("Claude SDK auth-token", self.claude_sdk_auth_token)
         claude_form.addRow("默认 Claude effort", self.default_effort)
-        claude_form.addRow("Claude CLI 路径", self._path_row(self.claude_bin, self._browse_claude_bin))
         claude_layout.addLayout(claude_form)
+
+        self.claude_advanced_toggle = QPushButton("高级可选")
+        self.claude_advanced_toggle.setCheckable(True)
+        self.claude_advanced_toggle.setProperty("kind", "ghost")
+        self.claude_advanced_toggle.setChecked(False)
+
+        self.claude_advanced_panel = QWidget()
+        self.claude_advanced_panel.setVisible(False)
+        claude_advanced_layout = QVBoxLayout(self.claude_advanced_panel)
+        claude_advanced_layout.setContentsMargins(0, 0, 0, 0)
+        claude_advanced_layout.setSpacing(0)
+        claude_advanced_form = QFormLayout()
+        _configure_form_layout(claude_advanced_form)
+        claude_advanced_form.addRow("Claude CLI 路径", self._path_row(self.claude_bin, self._browse_claude_bin))
+        claude_advanced_layout.addLayout(claude_advanced_form)
+
+        claude_layout.addWidget(self.claude_advanced_toggle, 0, Qt.AlignLeft)
+        claude_layout.addWidget(self.claude_advanced_panel)
 
         opencode_page = QWidget()
         opencode_layout = QVBoxLayout(opencode_page)
@@ -990,6 +1007,7 @@ class SettingsPage(QWidget):
 
         self.save_button.clicked.connect(self.save_requested.emit)
         self.default_backend.currentTextChanged.connect(self._apply_backend_mode)
+        self.claude_advanced_toggle.toggled.connect(self._toggle_claude_advanced)
 
     def load_settings(
         self,
@@ -1059,6 +1077,9 @@ class SettingsPage(QWidget):
         self.backend_section_title.setText("Claude 默认配置")
         self.backend_stack.setCurrentIndex(0)
         self.guidance.setText("Claude SDK base-url 会保存到本地设置；Claude auth-token 只保留在当前窗口内存。")
+
+    def _toggle_claude_advanced(self, checked: bool) -> None:
+        self.claude_advanced_panel.setVisible(bool(checked))
 
     def _path_row(self, line_edit: QLineEdit, browse_callback) -> QWidget:
         row = QWidget()
