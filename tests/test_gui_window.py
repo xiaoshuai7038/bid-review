@@ -94,6 +94,9 @@ def test_review_page_form_controls_keep_usable_height(tmp_path: Path, monkeypatc
     app.processEvents()
 
     page = window.review_page
+    assert page.run_button.isVisible()
+    assert page.open_output_button.isVisible()
+    assert page.run_button.isEnabled()
     assert page.backend_combo.height() >= 34
     assert page.model_edit.height() >= 34
     assert page.model_edit.text() == "ark-code-latest"
