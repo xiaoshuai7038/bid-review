@@ -86,6 +86,13 @@ EFFORT_ITEMS: list[tuple[str, str]] = [
     ("仔细", "high"),
 ]
 
+APP_DISPLAY_NAME = "标书审查工作台"
+
+BACKEND_ITEMS: list[tuple[str, str]] = [
+    ("Claude 引擎", "claude"),
+    ("OpenCode 引擎", "opencode"),
+]
+
 
 def _pin_form_field_height(widget: QWidget, min_height: int = 40) -> None:
     widget.setMinimumHeight(min_height)
@@ -104,6 +111,12 @@ def _configure_form_layout(form: QFormLayout) -> None:
 def _populate_progress_level_combo(combo: QComboBox) -> None:
     combo.clear()
     for label, value in PROGRESS_LEVEL_ITEMS:
+        combo.addItem(label, value)
+
+
+def _populate_backend_combo(combo: QComboBox) -> None:
+    combo.clear()
+    for label, value in BACKEND_ITEMS:
         combo.addItem(label, value)
 
 
@@ -128,6 +141,37 @@ def _combo_value(combo: QComboBox) -> str:
     if data is not None:
         return str(data).strip()
     return combo.currentText().strip()
+
+
+def _role_reasoning_text(reasoning: str) -> str:
+    raw = (reasoning or "").strip()
+    normalized = raw.lower()
+    mapping = {
+        "manual": "手动指定招标文件和投标文件",
+        "manual+tender": "手动指定招标文件，系统自动收集投标文件",
+    }
+    if not raw:
+        return "未记录"
+    if normalized in mapping:
+        return mapping[normalized]
+    if any("\u4e00" <= char <= "\u9fff" for char in raw):
+        return raw
+    return f"自动识别（{raw}）"
+
+
+def _friendly_progress_message(message: str) -> str:
+    display = message
+    replacements = {
+        "[pipeline]": "[流程]",
+        "[agent]": "[审查引擎]",
+        "[desktop]": "[工作台]",
+        "backend=claude": "审查引擎=Claude",
+        "backend=opencode": "审查引擎=OpenCode",
+        "run_pipeline": "现有审查流程",
+    }
+    for raw, friendly in replacements.items():
+        display = display.replace(raw, friendly)
+    return display
 
 
 def _extract_local_file_paths_from_urls(urls: list[QUrl]) -> list[str]:
@@ -236,11 +280,11 @@ class SingleFileDropCard(SurfaceFrame):
         title_label.setObjectName("SectionTitle")
         self.hint_label = QLabel(hint)
         self.hint_label.setObjectName("MutedLabel")
-        self.path_label = QLabel("拖入文件或点击浏览")
+        self.path_label = QLabel("拖入文件或点击选择")
         self.path_label.setWordWrap(True)
 
         action_row = QHBoxLayout()
-        self.browse_button = QPushButton("浏览文件")
+        self.browse_button = QPushButton("选择文件")
         self.browse_button.setProperty("kind", "primary")
         self.clear_button = QPushButton("清空")
         self.clear_button.setProperty("kind", "ghost")
@@ -308,7 +352,7 @@ class SingleFileDropCard(SurfaceFrame):
 
     def clear(self) -> None:
         self._path = ""
-        self.path_label.setText("拖入文件或点击浏览")
+        self.path_label.setText("拖入文件或点击选择")
         self.hint_label.setText(self._hint)
 
     def file_path(self) -> str:
@@ -453,21 +497,21 @@ class HomePage(QWidget):
 
         left = QVBoxLayout()
         left.setSpacing(12)
-        badge = QLabel("Windows Desktop Review Suite")
+        badge = QLabel("招投标文件审查")
         badge.setObjectName("Badge")
-        title = QLabel("面向招投标审查链路的桌面工作台")
+        title = QLabel("面向招投标业务的标书审查工作台")
         title.setObjectName("HeroTitle")
         title.setWordWrap(True)
         desc = QLabel(
-            "用桌面端承接现有 CLI 审查能力：拖入文件、配置后端、查看进度、回看报告，"
-            "维持原有输出契约和批量审查路径。"
+            "在桌面端完成选文件、设置审查方式、跟踪进度和查看报告，"
+            "全程沿用现有审查流程与导出结果。"
         )
         desc.setWordWrap(True)
         desc.setObjectName("MutedLabel")
         action_row = QHBoxLayout()
-        self.new_button = QPushButton("新建审查任务")
+        self.new_button = QPushButton("新建审查")
         self.new_button.setProperty("kind", "primary")
-        self.open_recent_button = QPushButton("打开最近结果")
+        self.open_recent_button = QPushButton("查看最近结果")
         self.open_recent_button.setProperty("kind", "ghost")
         action_row.addWidget(self.new_button)
         action_row.addWidget(self.open_recent_button)
@@ -485,10 +529,10 @@ class HomePage(QWidget):
         icon_label.setPixmap(pixmap if not pixmap.isNull() else QPixmap())
         right.addWidget(icon_label, 0, Qt.AlignLeft)
 
-        self.hero_cards = [StatCard("双后端"), StatCard("批量审查"), StatCard("报告出口")]
-        self.hero_cards[0].set_value("Claude / OpenCode", "沿用现有后端切换")
-        self.hero_cards[1].set_value("1 + N", "1 份招标文件 + 多份投标文件")
-        self.hero_cards[2].set_value("JSON / MD / DOCX", "保留 batch_summary.json")
+        self.hero_cards = [StatCard("审查引擎"), StatCard("批量处理"), StatCard("结果查看")]
+        self.hero_cards[0].set_value("Claude / OpenCode", "可切换两种审查引擎")
+        self.hero_cards[1].set_value("1 份招标 + 多份投标", "一次可检查多份投标文件")
+        self.hero_cards[2].set_value("结构化结果 + 报告", "支持打开批量汇总和单份报告")
         for card in self.hero_cards:
             right.addWidget(card)
         right.addStretch(1)
@@ -500,11 +544,11 @@ class HomePage(QWidget):
         recent_layout = QVBoxLayout(recent)
         recent_layout.setContentsMargins(24, 20, 24, 20)
         recent_layout.setSpacing(10)
-        recent_title = QLabel("最近一次运行")
+        recent_title = QLabel("最近一次审查")
         recent_title.setObjectName("SectionTitle")
         self.recent_path = QLabel("暂无可用运行记录")
         self.recent_path.setWordWrap(True)
-        self.recent_meta = QLabel("完成一次审查后，这里会显示最新产物入口。")
+        self.recent_meta = QLabel("完成一次审查后，这里会显示最近结果入口。")
         self.recent_meta.setObjectName("MutedLabel")
         recent_open_row = QHBoxLayout()
         self.recent_open_button = QPushButton("查看最近结果")
@@ -527,11 +571,11 @@ class HomePage(QWidget):
     def set_recent(self, result: BatchReviewData | None) -> None:
         if result is None or not result.runs:
             self.recent_path.setText("暂无可用运行记录")
-            self.recent_meta.setText("完成一次审查后，这里会显示最新产物入口。")
+            self.recent_meta.setText("完成一次审查后，这里会显示最近结果入口。")
             return
         self.recent_path.setText(str(result.batch_summary_path))
         self.recent_meta.setText(
-            f"招标文件：{_basename(result.tender_path)} | 投标文件数：{len(result.runs)} | 最近运行目录：{result.output_dir}"
+            f"招标文件：{_basename(result.tender_path)} | 投标文件：{len(result.runs)} 份 | 结果目录：{result.output_dir}"
         )
 
 
@@ -556,11 +600,11 @@ class ReviewPage(QWidget):
         top_actions_layout = QVBoxLayout(top_actions)
         top_actions_layout.setContentsMargins(24, 18, 24, 18)
         top_actions_layout.setSpacing(12)
-        self.command_hint = QLabel("先确认文件和参数，再直接开始审查。")
+        self.command_hint = QLabel("确认文件和参数后，即可开始审查。")
         self.command_hint.setObjectName("MutedLabel")
         self.run_button = QPushButton("开始审查")
         self.run_button.setProperty("kind", "primary")
-        self.open_output_button = QPushButton("打开输出目录")
+        self.open_output_button = QPushButton("打开结果目录")
         self.open_output_button.setProperty("kind", "ghost")
         top_action_row = QHBoxLayout()
         top_action_row.addWidget(self.run_button)
@@ -577,8 +621,8 @@ class ReviewPage(QWidget):
 
         file_row = QHBoxLayout()
         file_row.setSpacing(18)
-        self.tender_card = SingleFileDropCard("招标文件", "仅 1 份，用于建立硬性要求与评审基线")
-        self.bid_card = MultiFileDropCard("投标文件", "支持 1..N 份投标文件批量审查")
+        self.tender_card = SingleFileDropCard("招标文件", "仅需 1 份，用于提取招标要求和评审基线")
+        self.bid_card = MultiFileDropCard("投标文件", "支持同时审查 1 份或多份投标文件")
         file_row.addWidget(self.tender_card, 1)
         file_row.addWidget(self.bid_card, 1)
 
@@ -586,23 +630,23 @@ class ReviewPage(QWidget):
         config_layout = QVBoxLayout(config_card)
         config_layout.setContentsMargins(24, 20, 24, 20)
         config_layout.setSpacing(16)
-        config_title = QLabel("审查配置")
+        config_title = QLabel("本次审查设置")
         config_title.setObjectName("SectionTitle")
 
         self.backend_combo = QComboBox()
-        self.backend_combo.addItems(["claude", "opencode"])
+        _populate_backend_combo(self.backend_combo)
         self.model_edit = QLineEdit()
-        self.model_edit.setPlaceholderText("可选，覆盖默认模型")
+        self.model_edit.setPlaceholderText("可选，临时指定本次使用的 Claude 模型")
         self.progress_combo = QComboBox()
         _populate_progress_level_combo(self.progress_combo)
         self.output_dir_edit = QLineEdit()
-        self.output_dir_button = QPushButton("浏览")
+        self.output_dir_button = QPushButton("选择")
         self.timeout_spin = QSpinBox()
         self.timeout_spin.setRange(60, 7200)
         self.timeout_spin.setSingleStep(60)
         self.effort_combo = QComboBox()
         _populate_effort_combo(self.effort_combo)
-        self.save_raw_checkbox = QCheckBox("保存原始输出（claude_raw_output.txt）")
+        self.save_raw_checkbox = QCheckBox("保留原始运行记录（便于排查问题）")
         self.save_raw_checkbox.setChecked(True)
 
         form = QFormLayout()
@@ -617,9 +661,9 @@ class ReviewPage(QWidget):
         self.output_dir_button.setMinimumHeight(40)
         self.output_dir_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
-        form.addRow("后端", self.backend_combo)
-        form.addRow("模型", self.model_edit)
-        form.addRow("进度级别", self.progress_combo)
+        form.addRow("审查引擎", self.backend_combo)
+        form.addRow("模型名称（可选）", self.model_edit)
+        form.addRow("过程显示", self.progress_combo)
 
         output_row = QHBoxLayout()
         output_row.setContentsMargins(0, 0, 0, 0)
@@ -630,8 +674,8 @@ class ReviewPage(QWidget):
         output_wrap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         output_wrap.setMinimumHeight(40)
         output_wrap.setLayout(output_row)
-        form.addRow("输出目录", output_wrap)
-        form.addRow("超时（秒）", self.timeout_spin)
+        form.addRow("结果保存位置", output_wrap)
+        form.addRow("超时时间（秒）", self.timeout_spin)
         form.addRow("审查仔细程度", self.effort_combo)
 
         config_layout.addWidget(config_title)
@@ -642,14 +686,14 @@ class ReviewPage(QWidget):
         instruction_layout = QVBoxLayout(instruction_card)
         instruction_layout.setContentsMargins(24, 20, 24, 20)
         instruction_layout.setSpacing(12)
-        instruction_title = QLabel("任务补充说明")
+        instruction_title = QLabel("补充说明")
         instruction_title.setObjectName("SectionTitle")
-        instruction_note = QLabel("这里传入的是现有 CLI 的 `--instruction` 与 `--user-instruction`。")
+        instruction_note = QLabel("这些说明会追加到本次审查中，用来表达关注重点和个人偏好。")
         instruction_note.setObjectName("MutedLabel")
         self.instruction_edit = AutoResizingPlainTextEdit(min_rows=2, max_rows=8)
-        self.instruction_edit.setPlaceholderText("附加任务指令")
+        self.instruction_edit.setPlaceholderText("补充本次关注重点，例如优先检查资格条件")
         self.user_instruction_edit = AutoResizingPlainTextEdit(min_rows=2, max_rows=8)
-        self.user_instruction_edit.setPlaceholderText("用户个人指令")
+        self.user_instruction_edit.setPlaceholderText("补充个人偏好，例如证据需附原文片段")
         instruction_layout.addWidget(instruction_title)
         instruction_layout.addWidget(instruction_note)
         instruction_layout.addWidget(self.instruction_edit)
@@ -659,7 +703,7 @@ class ReviewPage(QWidget):
         action_layout = QVBoxLayout(action_card)
         action_layout.setContentsMargins(24, 20, 24, 20)
         action_layout.setSpacing(12)
-        bottom_hint = QLabel("GUI 直接复用 `run_pipeline`，不会替换现有 CLI 链路。")
+        bottom_hint = QLabel("桌面端沿用现有审查流程和导出结果，不改变命令行链路。")
         bottom_hint.setObjectName("MutedLabel")
         action_layout.addWidget(bottom_hint)
 
@@ -689,9 +733,9 @@ class ReviewPage(QWidget):
         status_layout.setContentsMargins(24, 20, 24, 20)
         status_layout.setHorizontalSpacing(18)
         status_layout.setVerticalSpacing(10)
-        status_title = QLabel("运行状态")
+        status_title = QLabel("执行状态")
         status_title.setObjectName("SectionTitle")
-        self.stage_value = QLabel("等待启动")
+        self.stage_value = QLabel("等待开始")
         self.current_bid_value = QLabel("未开始")
         self.result_value = QLabel("就绪")
         self.stage_value.setWordWrap(True)
@@ -700,7 +744,7 @@ class ReviewPage(QWidget):
         status_layout.addWidget(status_title, 0, 0, 1, 2)
         status_layout.addWidget(QLabel("当前阶段"), 1, 0)
         status_layout.addWidget(self.stage_value, 1, 1)
-        status_layout.addWidget(QLabel("当前投标"), 2, 0)
+        status_layout.addWidget(QLabel("当前投标文件"), 2, 0)
         status_layout.addWidget(self.current_bid_value, 2, 1)
         status_layout.addWidget(QLabel("任务状态"), 3, 0)
         status_layout.addWidget(self.result_value, 3, 1)
@@ -709,7 +753,7 @@ class ReviewPage(QWidget):
         timeline_layout = QVBoxLayout(timeline_card)
         timeline_layout.setContentsMargins(24, 20, 24, 20)
         timeline_layout.setSpacing(12)
-        timeline_title = QLabel("进度时间线")
+        timeline_title = QLabel("处理进度")
         timeline_title.setObjectName("SectionTitle")
         self.timeline_list = QListWidget()
         timeline_layout.addWidget(timeline_title)
@@ -719,7 +763,7 @@ class ReviewPage(QWidget):
         log_layout = QVBoxLayout(log_card)
         log_layout.setContentsMargins(24, 20, 24, 20)
         log_layout.setSpacing(12)
-        log_title = QLabel("运行日志")
+        log_title = QLabel("详细记录")
         log_title.setObjectName("SectionTitle")
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
@@ -741,7 +785,7 @@ class ReviewPage(QWidget):
 
         self.output_dir_button.clicked.connect(self._browse_output_dir)
         self.open_output_button.clicked.connect(self._open_output_dir)
-        self.backend_combo.currentTextChanged.connect(self._on_backend_changed)
+        self.backend_combo.currentIndexChanged.connect(lambda _index: self._on_backend_changed(_combo_value(self.backend_combo)))
 
     def eventFilter(self, watched: object, event: object) -> bool:
         if watched is self.left_scroll.viewport() and hasattr(event, "type"):
@@ -795,7 +839,7 @@ class ReviewPage(QWidget):
         backend = settings.default_backend or "claude"
         self._last_model_backend = backend
         self.backend_combo.blockSignals(True)
-        self.backend_combo.setCurrentText(backend)
+        _set_combo_value(self.backend_combo, backend)
         self.backend_combo.blockSignals(False)
         self.model_edit.setText(self._backend_model_defaults.get(backend, ""))
         self._update_model_placeholder(backend)
@@ -810,7 +854,7 @@ class ReviewPage(QWidget):
         return ReviewRunRequest(
             tender_path=self.tender_card.file_path(),
             bid_paths=self.bid_card.paths(),
-            backend=self.backend_combo.currentText().strip(),
+            backend=_combo_value(self.backend_combo),
             output_dir=self.output_dir_edit.text().strip(),
             model=self.model_edit.text().strip(),
             claude_bin=settings.claude_bin.strip(),
@@ -829,15 +873,16 @@ class ReviewPage(QWidget):
     def clear_progress(self) -> None:
         self.log_view.clear()
         self.timeline_list.clear()
-        self.stage_value.setText("等待启动")
+        self.stage_value.setText("等待开始")
         self.current_bid_value.setText("未开始")
         self.result_value.setText("就绪")
 
     def append_progress(self, message: str, level: str) -> None:
         timestamp = QDateTime.currentDateTime().toString("HH:mm:ss")
-        self.log_view.appendPlainText(f"[{timestamp}] {message}")
+        display_message = _friendly_progress_message(message)
+        self.log_view.appendPlainText(f"[{timestamp}] {display_message}")
         if message.startswith("[pipeline]") or message.startswith("[agent]") or level in {"basic", "agent"}:
-            self.timeline_list.addItem(f"{timestamp}  {message}")
+            self.timeline_list.addItem(f"{timestamp}  {display_message}")
             self.timeline_list.scrollToBottom()
         self._update_status(message)
 
@@ -848,23 +893,23 @@ class ReviewPage(QWidget):
 
     def _update_status(self, message: str) -> None:
         if "自动识别招标/投标文件角色" in message:
-            self.stage_value.setText("正在识别文件角色")
+            self.stage_value.setText("正在识别文件类型")
         elif "角色识别完成" in message:
-            self.stage_value.setText("角色识别完成")
+            self.stage_value.setText("文件识别完成")
         elif "开始审查" in message:
-            self.stage_value.setText("正在执行逐份审查")
+            self.stage_value.setText("正在逐份审查")
             self.current_bid_value.setText(message.split(":", 1)[-1].strip())
             self.result_value.setText("运行中")
         elif "完成审查" in message:
-            self.stage_value.setText("已生成本轮报告")
+            self.stage_value.setText("本轮报告已生成")
         elif "会话已建立" in message:
-            self.stage_value.setText("后端会话已建立")
+            self.stage_value.setText("审查引擎已就绪")
         elif message.startswith("[agent]"):
             self.stage_value.setText(message.replace("[agent]", "", 1).strip())
 
     def _browse_output_dir(self) -> None:
         current = self.output_dir_edit.text().strip() or os.getcwd()
-        path = QFileDialog.getExistingDirectory(self, "选择输出目录", current)
+        path = QFileDialog.getExistingDirectory(self, "选择结果保存位置", current)
         if path:
             self.output_dir_edit.setText(str(Path(path).resolve()))
 
@@ -883,9 +928,9 @@ class ReviewPage(QWidget):
 
     def _update_model_placeholder(self, backend: str) -> None:
         if (backend or "claude").strip().lower() == "opencode":
-            self.model_edit.setPlaceholderText("可选，覆盖 OpenCode 默认模型")
+            self.model_edit.setPlaceholderText("可选，临时指定本次使用的 OpenCode 模型")
             return
-        self.model_edit.setPlaceholderText("可选，覆盖 Claude SDK 默认模型")
+        self.model_edit.setPlaceholderText("可选，临时指定本次使用的 Claude 模型")
 
 
 class ResultsPage(QWidget):
@@ -901,9 +946,9 @@ class ResultsPage(QWidget):
         meta_layout = QVBoxLayout(meta)
         meta_layout.setContentsMargins(24, 20, 24, 20)
         meta_layout.setSpacing(8)
-        meta_title = QLabel("当前结果集")
+        meta_title = QLabel("当前审查结果")
         meta_title.setObjectName("SectionTitle")
-        self.tender_label = QLabel("尚未加载结果")
+        self.tender_label = QLabel("尚未加载审查结果")
         self.tender_label.setWordWrap(True)
         self.role_label = QLabel("")
         self.role_label.setObjectName("MutedLabel")
@@ -913,10 +958,10 @@ class ResultsPage(QWidget):
 
         stats_row = QHBoxLayout()
         stats_row.setSpacing(18)
-        self.requirement_card = StatCard("硬性要求")
+        self.requirement_card = StatCard("招标要求")
         self.non_compliant_card = StatCard("不符合项")
         self.risk_card = StatCard("风险项")
-        self.manual_card = StatCard("需人工复核")
+        self.manual_card = StatCard("待人工确认")
         for card in [self.requirement_card, self.non_compliant_card, self.risk_card, self.manual_card]:
             stats_row.addWidget(card)
 
@@ -926,11 +971,11 @@ class ResultsPage(QWidget):
         control_layout.setSpacing(12)
         self.run_combo = QComboBox()
         self.run_combo.setMinimumWidth(360)
-        self.open_output_button = QPushButton("打开输出目录")
-        self.open_json_button = QPushButton("打开 JSON")
-        self.open_md_button = QPushButton("打开 Markdown")
-        self.open_docx_button = QPushButton("打开 DOCX")
-        self.open_batch_button = QPushButton("打开 batch_summary")
+        self.open_output_button = QPushButton("打开结果目录")
+        self.open_json_button = QPushButton("打开结构化结果")
+        self.open_md_button = QPushButton("打开文本报告")
+        self.open_docx_button = QPushButton("打开 Word 报告")
+        self.open_batch_button = QPushButton("打开批量汇总")
         for button in [
             self.open_output_button,
             self.open_json_button,
@@ -939,7 +984,7 @@ class ResultsPage(QWidget):
             self.open_batch_button,
         ]:
             button.setProperty("kind", "ghost")
-        control_layout.addWidget(QLabel("投标结果"))
+        control_layout.addWidget(QLabel("投标文件"))
         control_layout.addWidget(self.run_combo)
         control_layout.addStretch(1)
         control_layout.addWidget(self.open_output_button)
@@ -952,11 +997,11 @@ class ResultsPage(QWidget):
         table_layout = QVBoxLayout(table_card)
         table_layout.setContentsMargins(24, 20, 24, 20)
         table_layout.setSpacing(12)
-        table_title = QLabel("发现项明细")
+        table_title = QLabel("问题与建议明细")
         table_title.setObjectName("SectionTitle")
         self.findings_table = QTableWidget(0, 7)
         self.findings_table.setHorizontalHeaderLabels(
-            ["ID", "条款ID", "结论", "问题", "招标证据", "投标证据", "建议"]
+            ["编号", "条款编号", "结论", "问题说明", "招标依据", "投标依据", "处理建议"]
         )
         self.findings_table.setAlternatingRowColors(True)
         self.findings_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -988,13 +1033,13 @@ class ResultsPage(QWidget):
         self.run_combo.clear()
         self.findings_table.setRowCount(0)
         if result is None or not result.runs:
-            self.tender_label.setText("尚未加载结果")
+            self.tender_label.setText("尚未加载审查结果")
             self.role_label.setText("")
             self.run_combo.blockSignals(False)
             return
         self.tender_label.setText(f"招标文件：{result.tender_path}")
         self.role_label.setText(
-            f"角色识别：{result.role_reasoning or 'manual'} | 运行目录：{result.output_dir}"
+            f"文件识别方式：{_role_reasoning_text(result.role_reasoning or 'manual')} | 结果目录：{result.output_dir}"
         )
         for idx, run in enumerate(result.runs, start=1):
             self.run_combo.addItem(f"{idx}. {_basename(run.bid_path)}", run)
@@ -1014,9 +1059,9 @@ class ResultsPage(QWidget):
             return
         summary = run.report.get("summary", run.summary) or {}
         self.requirement_card.set_value(str(summary.get("requirement_count", 0)), _basename(run.bid_path))
-        self.non_compliant_card.set_value(str(summary.get("non_compliant_count", 0)), "需整改")
-        self.risk_card.set_value(str(summary.get("risk_count", 0)), "需关注")
-        self.manual_card.set_value(str(summary.get("needs_manual_count", 0)), "待人工确认")
+        self.non_compliant_card.set_value(str(summary.get("non_compliant_count", 0)), "需尽快整改")
+        self.risk_card.set_value(str(summary.get("risk_count", 0)), "建议重点关注")
+        self.manual_card.set_value(str(summary.get("needs_manual_count", 0)), "建议人工复核")
 
         findings = run.report.get("findings", []) or []
         self.findings_table.setRowCount(len(findings))
@@ -1084,11 +1129,11 @@ class SettingsPage(QWidget):
         toolchain_layout = QVBoxLayout(toolchain)
         toolchain_layout.setContentsMargins(24, 20, 24, 20)
         toolchain_layout.setSpacing(16)
-        toolchain_title = QLabel("工具链与默认行为")
+        toolchain_title = QLabel("默认审查设置")
         toolchain_title.setObjectName("SectionTitle")
 
         self.default_backend = QComboBox()
-        self.default_backend.addItems(["claude", "opencode"])
+        _populate_backend_combo(self.default_backend)
         self.default_progress = QComboBox()
         _populate_progress_level_combo(self.default_progress)
         self.default_timeout = QSpinBox()
@@ -1098,24 +1143,24 @@ class SettingsPage(QWidget):
         self.common_output_dir_row = self._path_row(self.output_dir, self._browse_output_dir)
 
         self.claude_default_model = QLineEdit()
-        self.claude_default_model.setPlaceholderText("Claude SDK 默认读取 ANTHROPIC_MODEL")
+        self.claude_default_model.setPlaceholderText("未填写时使用环境变量中的默认 Claude 模型")
         self.default_effort = QComboBox()
         _populate_effort_combo(self.default_effort)
         self.claude_sdk_base_url = QLineEdit()
-        self.claude_sdk_base_url.setPlaceholderText("https://ark.cn-beijing.volces.com/api/coding")
+        self.claude_sdk_base_url.setPlaceholderText("可选，自定义 Claude 服务地址")
         self.claude_sdk_auth_token = QLineEdit()
         self.claude_sdk_auth_token.setEchoMode(QLineEdit.Password)
-        self.claude_sdk_auth_token.setPlaceholderText("仅当前窗口会话使用，不写入 settings.json")
+        self.claude_sdk_auth_token.setPlaceholderText("仅当前窗口临时使用，不会写入本地设置")
         self.claude_bin = QLineEdit()
 
         self.opencode_default_model = QLineEdit()
-        self.opencode_default_model.setPlaceholderText("OpenCode 默认模型")
+        self.opencode_default_model.setPlaceholderText("未填写时使用 OpenCode 的默认模型")
         self.opencode_bin = QLineEdit()
         self.opencode_provider = QLineEdit()
         self.opencode_api_url = QLineEdit()
         self.opencode_api_key = QLineEdit()
         self.opencode_api_key.setEchoMode(QLineEdit.Password)
-        self.opencode_api_key.setPlaceholderText("仅当前窗口会话使用，不写入 settings.json")
+        self.opencode_api_key.setPlaceholderText("仅当前窗口临时使用，不会写入本地设置")
 
         common_form = QFormLayout()
         _configure_form_layout(common_form)
@@ -1123,12 +1168,12 @@ class SettingsPage(QWidget):
         _pin_form_field_height(self.default_progress)
         _pin_form_field_height(self.default_timeout)
         _pin_form_field_height(self.output_dir)
-        common_title = QLabel("通用默认项")
+        common_title = QLabel("通用默认设置")
         common_title.setObjectName("SectionTitle")
-        common_form.addRow("默认后端", self.default_backend)
-        common_form.addRow("默认进度级别", self.default_progress)
-        common_form.addRow("默认超时（秒）", self.default_timeout)
-        common_form.addRow("默认输出目录", self.common_output_dir_row)
+        common_form.addRow("默认审查引擎", self.default_backend)
+        common_form.addRow("默认过程显示", self.default_progress)
+        common_form.addRow("默认超时时间（秒）", self.default_timeout)
+        common_form.addRow("默认结果保存位置", self.common_output_dir_row)
 
         self.backend_section_title = QLabel("")
         self.backend_section_title.setObjectName("SectionTitle")
@@ -1145,13 +1190,13 @@ class SettingsPage(QWidget):
         _pin_form_field_height(self.claude_sdk_base_url)
         _pin_form_field_height(self.claude_sdk_auth_token)
         _pin_form_field_height(self.claude_bin)
-        claude_form.addRow("Claude 模型", self.claude_default_model)
-        claude_form.addRow("Claude SDK base-url", self.claude_sdk_base_url)
-        claude_form.addRow("Claude SDK auth-token", self.claude_sdk_auth_token)
+        claude_form.addRow("默认 Claude 模型", self.claude_default_model)
+        claude_form.addRow("Claude 服务地址", self.claude_sdk_base_url)
+        claude_form.addRow("Claude 访问凭证", self.claude_sdk_auth_token)
         claude_form.addRow("默认审查仔细程度", self.default_effort)
         claude_layout.addLayout(claude_form)
 
-        self.claude_advanced_toggle = QPushButton("高级可选")
+        self.claude_advanced_toggle = QPushButton("显示高级设置")
         self.claude_advanced_toggle.setCheckable(True)
         self.claude_advanced_toggle.setProperty("kind", "ghost")
         self.claude_advanced_toggle.setChecked(False)
@@ -1163,7 +1208,7 @@ class SettingsPage(QWidget):
         claude_advanced_layout.setSpacing(0)
         claude_advanced_form = QFormLayout()
         _configure_form_layout(claude_advanced_form)
-        claude_advanced_form.addRow("Claude CLI 路径", self._path_row(self.claude_bin, self._browse_claude_bin))
+        claude_advanced_form.addRow("Claude 命令行程序路径", self._path_row(self.claude_bin, self._browse_claude_bin))
         claude_advanced_layout.addLayout(claude_advanced_form)
 
         claude_layout.addWidget(self.claude_advanced_toggle, 0, Qt.AlignLeft)
@@ -1180,11 +1225,11 @@ class SettingsPage(QWidget):
         _pin_form_field_height(self.opencode_provider)
         _pin_form_field_height(self.opencode_api_url)
         _pin_form_field_height(self.opencode_api_key)
-        opencode_form.addRow("OpenCode 模型", self.opencode_default_model)
-        opencode_form.addRow("OpenCode 路径", self._path_row(self.opencode_bin, self._browse_opencode_bin))
-        opencode_form.addRow("OpenCode provider", self.opencode_provider)
-        opencode_form.addRow("OpenCode api-url", self.opencode_api_url)
-        opencode_form.addRow("OpenCode api-key", self.opencode_api_key)
+        opencode_form.addRow("默认 OpenCode 模型", self.opencode_default_model)
+        opencode_form.addRow("OpenCode 程序路径", self._path_row(self.opencode_bin, self._browse_opencode_bin))
+        opencode_form.addRow("服务提供方", self.opencode_provider)
+        opencode_form.addRow("服务地址", self.opencode_api_url)
+        opencode_form.addRow("访问密钥", self.opencode_api_key)
         opencode_layout.addLayout(opencode_form)
 
         self.backend_stack.addWidget(claude_page)
@@ -1204,20 +1249,20 @@ class SettingsPage(QWidget):
         instruction_layout = QVBoxLayout(instruction_card)
         instruction_layout.setContentsMargins(24, 20, 24, 20)
         instruction_layout.setSpacing(12)
-        instruction_title = QLabel("默认补充指令")
+        instruction_title = QLabel("默认补充说明")
         instruction_title.setObjectName("SectionTitle")
         self.default_instruction = QPlainTextEdit()
         self.default_instruction.setMinimumHeight(120)
-        self.default_instruction.setPlaceholderText("默认 --instruction")
+        self.default_instruction.setPlaceholderText("每次审查默认追加的任务说明")
         self.default_user_instruction = QPlainTextEdit()
         self.default_user_instruction.setMinimumHeight(120)
-        self.default_user_instruction.setPlaceholderText("默认 --user-instruction")
+        self.default_user_instruction.setPlaceholderText("每次审查默认追加的个人偏好说明")
         instruction_layout.addWidget(instruction_title)
         instruction_layout.addWidget(self.default_instruction)
         instruction_layout.addWidget(self.default_user_instruction)
 
         action_row = QHBoxLayout()
-        self.save_button = QPushButton("保存设置")
+        self.save_button = QPushButton("保存默认设置")
         self.save_button.setProperty("kind", "primary")
         action_row.addWidget(self.save_button)
         action_row.addStretch(1)
@@ -1236,7 +1281,7 @@ class SettingsPage(QWidget):
         layout.addWidget(self.scroll, 1)
 
         self.save_button.clicked.connect(self.save_requested.emit)
-        self.default_backend.currentTextChanged.connect(self._apply_backend_mode)
+        self.default_backend.currentIndexChanged.connect(lambda _index: self._apply_backend_mode(_combo_value(self.default_backend)))
         self.claude_advanced_toggle.toggled.connect(self._toggle_claude_advanced)
 
     def load_settings(
@@ -1247,7 +1292,7 @@ class SettingsPage(QWidget):
     ) -> None:
         backend = settings.default_backend or "claude"
         self.default_backend.blockSignals(True)
-        self.default_backend.setCurrentText(backend)
+        _set_combo_value(self.default_backend, backend)
         self.default_backend.blockSignals(False)
         self.claude_default_model.setText(settings.model_for_backend("claude"))
         self.opencode_default_model.setText(settings.model_for_backend("opencode"))
@@ -1267,7 +1312,7 @@ class SettingsPage(QWidget):
         self._apply_backend_mode(backend)
 
     def snapshot(self, previous: DesktopSettings) -> DesktopSettings:
-        backend = self.default_backend.currentText().strip()
+        backend = _combo_value(self.default_backend)
         claude_model = self.claude_default_model.text().strip()
         opencode_model = self.opencode_default_model.text().strip()
         return DesktopSettings(
@@ -1299,24 +1344,25 @@ class SettingsPage(QWidget):
     def _apply_backend_mode(self, backend: str) -> None:
         normalized = (backend or "claude").strip().lower()
         if normalized == "opencode":
-            self.backend_section_title.setText("OpenCode 默认配置")
+            self.backend_section_title.setText("OpenCode 默认设置")
             self.backend_stack.setCurrentIndex(1)
-            self.guidance.setText("OpenCode provider 与 api-url 会保存到本地设置；api-key 只保留在当前窗口内存。")
+            self.guidance.setText("这里保存 OpenCode 的默认模型和服务地址；访问密钥只保留在当前窗口。")
             return
 
-        self.backend_section_title.setText("Claude 默认配置")
+        self.backend_section_title.setText("Claude 默认设置")
         self.backend_stack.setCurrentIndex(0)
-        self.guidance.setText("Claude SDK base-url 会保存到本地设置；Claude auth-token 只保留在当前窗口内存。")
+        self.guidance.setText("这里保存 Claude 的默认模型和服务地址；访问凭证只保留在当前窗口。")
 
     def _toggle_claude_advanced(self, checked: bool) -> None:
         self.claude_advanced_panel.setVisible(bool(checked))
+        self.claude_advanced_toggle.setText("隐藏高级设置" if checked else "显示高级设置")
 
     def _path_row(self, line_edit: QLineEdit, browse_callback) -> QWidget:
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
-        button = QPushButton("浏览")
+        button = QPushButton("选择")
         button.setMinimumHeight(40)
         button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         button.clicked.connect(browse_callback)
@@ -1327,17 +1373,17 @@ class SettingsPage(QWidget):
         return row
 
     def _browse_output_dir(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "选择输出目录", self.output_dir.text().strip() or os.getcwd())
+        path = QFileDialog.getExistingDirectory(self, "选择结果保存位置", self.output_dir.text().strip() or os.getcwd())
         if path:
             self.output_dir.setText(str(Path(path).resolve()))
 
     def _browse_claude_bin(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "选择 Claude 可执行文件", self.claude_bin.text().strip() or os.getcwd())
+        path, _ = QFileDialog.getOpenFileName(self, "选择 Claude 程序文件", self.claude_bin.text().strip() or os.getcwd())
         if path:
             self.claude_bin.setText(str(Path(path).resolve()))
 
     def _browse_opencode_bin(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "选择 OpenCode 可执行文件", self.opencode_bin.text().strip() or os.getcwd())
+        path, _ = QFileDialog.getOpenFileName(self, "选择 OpenCode 程序文件", self.opencode_bin.text().strip() or os.getcwd())
         if path:
             self.opencode_bin.setText(str(Path(path).resolve()))
 
@@ -1346,7 +1392,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("RootWindow")
-        self.setWindowTitle("Bid Review Desktop")
+        self.setWindowTitle(APP_DISPLAY_NAME)
         self.resize(1560, 980)
         self.setMinimumSize(1320, 820)
         self._worker: ReviewWorker | None = None
@@ -1385,9 +1431,9 @@ class MainWindow(QMainWindow):
         brand_layout.setSpacing(10)
         icon_label = QLabel()
         icon_label.setPixmap(QIcon(str(_asset_path("brand_mark.svg"))).pixmap(72, 72))
-        title = QLabel("Bid Review Desktop")
+        title = QLabel(APP_DISPLAY_NAME)
         title.setObjectName("SectionTitle")
-        subtitle = QLabel("Windows 质感的桌面审查工作台")
+        subtitle = QLabel("面向招投标业务的桌面审查工具")
         subtitle.setObjectName("MutedLabel")
         subtitle.setWordWrap(True)
         brand_layout.addWidget(icon_label)
@@ -1396,7 +1442,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(brand)
 
         self.nav_buttons: list[QPushButton] = []
-        for index, label in enumerate(["首页", "新建审查", "结果查看", "设置"]):
+        for index, label in enumerate(["首页", "新建审查", "查看结果", "默认设置"]):
             button = QPushButton(label)
             button.setCheckable(True)
             button.setProperty("nav", "true")
@@ -1405,7 +1451,7 @@ class MainWindow(QMainWindow):
             layout.addWidget(button)
 
         layout.addStretch(1)
-        footer = QLabel("保留现有 CLI 链路与输出契约")
+        footer = QLabel("沿用现有审查链路和导出结果")
         footer.setObjectName("MutedLabel")
         footer.setWordWrap(True)
         layout.addWidget(footer)
@@ -1475,12 +1521,12 @@ class MainWindow(QMainWindow):
 
     def _set_current_page(self, index: int) -> None:
         page_meta = {
-            0: ("首页", "查看最近运行、快速进入新建审查任务。"),
-            1: ("新建审查任务", "配置招标文件、投标文件和后端参数，直接启动现有审查管线。"),
-            2: ("结果查看", "基于现有导出文件加载 summary、findings 与产物入口。"),
-            3: ("设置", "保存默认输出路径、后端路径和 OpenCode 高级参数。"),
+            0: ("首页", "查看最近审查结果，快速进入新建审查。"),
+            1: ("新建审查", "选择文件并确认参数后，直接启动现有审查流程。"),
+            2: ("查看结果", "基于现有导出文件查看汇总结论、问题清单和报告入口。"),
+            3: ("默认设置", "保存默认保存位置、审查引擎和高级连接参数。"),
         }
-        title, subtitle = page_meta.get(index, ("Bid Review Desktop", ""))
+        title, subtitle = page_meta.get(index, (APP_DISPLAY_NAME, ""))
         self.stack.setCurrentIndex(index)
         self.page_title.setText(title)
         self.page_subtitle.setText(subtitle)
@@ -1494,8 +1540,8 @@ class MainWindow(QMainWindow):
         self._apply_claude_sdk_env()
         self.store.save(self.settings)
         self.review_page.load_settings(self.settings)
-        self.status_badge.setText("设置已保存")
-        QMessageBox.information(self, "设置已保存", "桌面端默认配置已更新。")
+        self.status_badge.setText("默认设置已保存")
+        QMessageBox.information(self, "默认设置已保存", "工作台默认设置已更新。")
 
     def _load_recent_result(self) -> None:
         batch_summary = Path(self.settings.last_batch_summary) if self.settings.last_batch_summary else None
@@ -1514,7 +1560,7 @@ class MainWindow(QMainWindow):
 
     def _open_recent_result(self) -> None:
         if self.current_result is None:
-            QMessageBox.information(self, "暂无结果", "还没有可用的 batch_summary.json。")
+            QMessageBox.information(self, "暂无结果", "还没有可查看的批量汇总结果。")
             return
         self.results_page.set_result(self.current_result)
         self._set_current_page(2)
@@ -1549,7 +1595,7 @@ class MainWindow(QMainWindow):
         self.review_page.set_running(False)
         self.review_page.result_value.setText("失败")
         self.status_badge.setText("失败")
-        self.review_page.append_progress(f"[desktop] {message}", "basic")
+        self.review_page.append_progress(f"[工作台] {message}", "basic")
         QMessageBox.critical(self, "审查失败", message)
         self._worker = None
 

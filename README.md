@@ -141,34 +141,6 @@ uv run python -m app.main `
 uv run python -m app.main --input "..." --input "..." --output-dir "data/output" --no-raw-output
 ```
 
-## Codex 并行子智能体启动测试
-
-项目内提供了 4 路并行测试子智能体配置，可复用地验证 README 启动链路。
-
-- 子智能体配置：`config/subagents/startup-test-agents.json`
-- 并行调度脚本：`scripts/run-startup-subagents.ps1`
-- Skill 安装脚本：`scripts/install-codex-skill.ps1`
-
-先安装项目 Skill 到全局 `~/.codex/skills`（一次即可）：
-
-```powershell
-.\scripts\install-codex-skill.ps1 -Force
-```
-
-再执行并行启动测试（仍然使用 README 的 `uv run python -m app.main` 链路）：
-
-```powershell
-.\scripts\run-startup-subagents.ps1 `
-  -Tender "<招标文件路径>" `
-  -Bid "<投标文件1路径>","<投标文件2路径>"
-```
-
-每次运行会在 `data/output/subagent-startup/subagents-<timestamp>/` 生成：
-
-- `startup_subagent_report.json`（主线程汇总用）
-- `startup_subagent_report.md`（人工查看）
-- 每个子智能体的 `agent.log` 与各自 `run-*` 产物目录
-
 ## 清理无用产物
 
 如果你做过大量临时分析，根目录可能堆积未跟踪的 `txt/json/log` 文件。可用下面脚本清理：
@@ -279,8 +251,14 @@ uv run python -m app.main `
 
 桌面端采用 `PySide6`。
 
-默认提供一个更稳的 repo-local EXE：它会从仓库根目录自动定位 `.venv`，并启动 `pythonw -m app.gui.main`。
-这种方式不重打 Qt 运行时，适合当前项目开发和内网交付场景。
+当前默认推荐的是客户可交付的稳定 `onedir` 包。
+该产物不依赖仓库源码、`.venv`、`uv` 或本地 Python，适合直接交付到新的 Windows 客户机。
+
+首期客户交付范围：
+
+- 仅支持 `Claude` 后端
+- `ANTHROPIC_AUTH_TOKEN`、模型、base URL 等参数由用户在 GUI 中自行配置
+- 不处理 `OpenCode` 的客户交付、CLI 分发或运行保障
 
 执行：
 
@@ -300,19 +278,33 @@ dist\BidReviewDesktop\BidReviewDesktop.exe
 .\scripts\build-desktop.ps1 -Clean
 ```
 
-如需尝试自包含 standalone bundle，可显式指定：
+如果你正在运行旧版 `BidReviewDesktop.exe` 或 `BidReviewDesktopLauncher.exe`，请先关闭后再重新打包；脚本会在检测到旧进程占用时直接报错退出。
+
+如果你需要兼容旧命令，`standalone` 仍然作为别名保留：
 
 ```powershell
 .\scripts\build-desktop.ps1 -Mode standalone
 ```
 
-standalone 路径：
+产物路径仍然是：
 
 ```text
-dist\BidReviewDesktopStandalone\BidReviewDesktopStandalone.exe
+dist\BidReviewDesktop\BidReviewDesktop.exe
 ```
 
-当前 `standalone` 仍是实验性路径；默认推荐使用前面的 repo-local EXE。
+如需继续生成仓库内开发使用的 repo-local launcher，可显式指定：
+
+```powershell
+.\scripts\build-desktop.ps1 -Mode launcher
+```
+
+launcher 路径：
+
+```text
+dist\BidReviewDesktopLauncher\BidReviewDesktopLauncher.exe
+```
+
+`launcher` 依赖仓库根目录和 `.venv`，只适合项目开发或内部调试，不适合直接交付客户。
 
 ## 环境要求
 

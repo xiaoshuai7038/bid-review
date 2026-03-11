@@ -12,6 +12,12 @@ from app.gui.app import create_application
 from app.gui.window import MainWindow, MultiFileDropCard, SingleFileDropCard
 
 
+def _set_combo_to_value(combo, value: str) -> None:
+    index = combo.findData(value)
+    assert index >= 0
+    combo.setCurrentIndex(index)
+
+
 def test_main_window_boots_with_saved_settings(tmp_path: Path, monkeypatch) -> None:
     settings_path = tmp_path / "settings.json"
     settings_path.write_text(
@@ -31,7 +37,9 @@ def test_main_window_boots_with_saved_settings(tmp_path: Path, monkeypatch) -> N
     app = create_application([])
     window = MainWindow()
 
-    assert window.windowTitle() == "Bid Review Desktop"
+    assert app.applicationName() == "标书审查工作台"
+    assert app.applicationDisplayName() == "标书审查工作台"
+    assert window.windowTitle() == "标书审查工作台"
     assert window.review_page.output_dir_edit.text() == str(tmp_path / "output")
     window.close()
     app.quit()
@@ -100,6 +108,8 @@ def test_review_page_form_controls_keep_usable_height(tmp_path: Path, monkeypatc
     assert page.open_output_button.isVisible()
     assert page.run_button.isEnabled()
     assert page.backend_combo.height() >= 34
+    assert page.backend_combo.currentText() == "Claude 引擎"
+    assert page.backend_combo.currentData() == "claude"
     assert page.model_edit.height() >= 34
     assert page.model_edit.text() == "ark-code-latest"
     assert page.progress_combo.height() >= 34
@@ -148,6 +158,8 @@ def test_settings_page_form_controls_keep_usable_height(tmp_path: Path, monkeypa
 
     page = window.settings_page
     assert page.default_backend.height() >= 34
+    assert page.default_backend.currentText() == "Claude 引擎"
+    assert page.default_backend.currentData() == "claude"
     assert page.default_progress.currentText() == "简洁（推荐）"
     assert page.default_progress.currentData() == "agent"
     assert page.claude_default_model.height() >= 34
@@ -173,10 +185,10 @@ def test_settings_page_form_controls_keep_usable_height(tmp_path: Path, monkeypa
     assert page.claude_advanced_panel.isVisible()
     assert page.claude_bin.height() >= 34
 
-    page.default_backend.setCurrentText("opencode")
+    _set_combo_to_value(page.default_backend, "opencode")
     app.processEvents()
     assert page.backend_stack.currentIndex() == 1
-    assert page.backend_section_title.text() == "OpenCode 默认配置"
+    assert page.backend_section_title.text() == "OpenCode 默认设置"
 
     window.close()
     app.quit()
@@ -207,9 +219,13 @@ def test_review_page_switches_default_model_with_backend(tmp_path: Path, monkeyp
     app.processEvents()
 
     page = window.review_page
+    assert page.backend_combo.currentText() == "Claude 引擎"
+    assert page.backend_combo.currentData() == "claude"
     assert page.model_edit.text() == "ark-code-latest"
-    page.backend_combo.setCurrentText("opencode")
+    _set_combo_to_value(page.backend_combo, "opencode")
     app.processEvents()
+    assert page.backend_combo.currentText() == "OpenCode 引擎"
+    assert page.backend_combo.currentData() == "opencode"
     assert page.model_edit.text() == "DeepSeek-V3.2"
 
     window.close()
@@ -308,6 +324,40 @@ def test_review_page_instruction_editors_auto_grow_with_content(tmp_path: Path, 
 
     assert initial_height < grown_height
     assert grown_height <= 220
+
+    window.close()
+    app.quit()
+
+
+def test_results_page_uses_user_friendly_labels(tmp_path: Path, monkeypatch) -> None:
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "default_backend": "claude",
+                "default_output_dir": str(tmp_path / "output"),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BID_REVIEW_GUI_SETTINGS_PATH", str(settings_path))
+
+    app = create_application([])
+    window = MainWindow()
+    window.show()
+    window._set_current_page(2)
+    app.processEvents()
+
+    page = window.results_page
+    assert page.tender_label.text() == "尚未加载审查结果"
+    assert page.open_output_button.text() == "打开结果目录"
+    assert page.open_json_button.text() == "打开结构化结果"
+    assert page.open_md_button.text() == "打开文本报告"
+    assert page.open_docx_button.text() == "打开 Word 报告"
+    assert page.open_batch_button.text() == "打开批量汇总"
+    headers = [page.findings_table.horizontalHeaderItem(i).text() for i in range(page.findings_table.columnCount())]
+    assert headers == ["编号", "条款编号", "结论", "问题说明", "招标依据", "投标依据", "处理建议"]
 
     window.close()
     app.quit()

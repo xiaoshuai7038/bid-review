@@ -57,6 +57,9 @@ def test_review_prompts_require_precise_page_or_section_lines() -> None:
         bid_path="D:/code/docs/投标文件.docx",
         user_instruction="无",
         instruction="无",
+        tender_document_map="- 总页数: 100",
+        bid_document_map="- 检测到的正文/模板块数量: 10",
+        minimum_requirement_count="10",
     )
     second_prompt = render_prompt(
         "review_second_pass.md",
@@ -144,6 +147,7 @@ def test_run_bid_review_retries_when_precise_locations_still_missing(
 ) -> None:
     monkeypatch.setenv("BID_REVIEW_ENABLE_SECOND_PASS", "0")
     monkeypatch.setenv("BID_REVIEW_DOCX_OCR_REQUIRED", "0")
+    monkeypatch.setenv("BID_REVIEW_ENFORCE_COMPLETION_GATE", "0")
 
     bid_path = tmp_path / "bid.docx"
     doc = Document()
@@ -211,6 +215,7 @@ def test_location_retry_merges_precise_evidence_without_dropping_findings(
 ) -> None:
     monkeypatch.setenv("BID_REVIEW_ENABLE_SECOND_PASS", "0")
     monkeypatch.setenv("BID_REVIEW_DOCX_OCR_REQUIRED", "0")
+    monkeypatch.setenv("BID_REVIEW_ENFORCE_COMPLETION_GATE", "0")
 
     bid_path = tmp_path / "bid.docx"
     doc = Document()

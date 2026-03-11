@@ -28,8 +28,8 @@ def create_application(argv: list[str] | None = None) -> QApplication:
     if app is None:
         app = QApplication(argv or sys.argv)
 
-    app.setApplicationName("Bid Review Desktop")
-    app.setApplicationDisplayName("Bid Review Desktop")
+    app.setApplicationName("标书审查工作台")
+    app.setApplicationDisplayName("标书审查工作台")
     app.setOrganizationName("BidReview")
     app.setStyle("Fusion")
     app.setFont(_preferred_font())

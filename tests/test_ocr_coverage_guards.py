@@ -9,7 +9,6 @@ import pytest
 
 from app.llm.claude_client import ClaudeCallError
 from app.review.claude_review import (
-    _apply_docx_stability_guards_from_text,
     _docx_ocr_required_by_default,
     _has_forbidden_write_tool_call,
     _validate_docx_ocr_coverage,
@@ -411,32 +410,3 @@ def test_location_retry_forbidden_write_respects_strict_fail_policy(
             user_instruction="",
         )
 
-
-def test_stability_guards_keep_known_subject_mismatch_pattern() -> None:
-    report = {
-        "requirements": [
-            {"id": "R001", "category": "主体一致性", "text": "主体一致性校验", "source": "s"}
-        ],
-        "findings": [],
-        "summary": {},
-    }
-    docx_text = "招标人：示例招标方有限公司\n投标函\n投标人：示例招标方有限公司（盖公章）"
-
-    guarded = _apply_docx_stability_guards_from_text(report, docx_text)
-
-    assert any("招标人/采购人" in f["bid_evidence"] for f in guarded["findings"])
-
-
-def test_stability_guards_keep_known_cover_name_typo_pattern() -> None:
-    report = {
-        "requirements": [
-            {"id": "R001", "category": "主体一致性", "text": "主体一致性校验", "source": "s"}
-        ],
-        "findings": [],
-        "summary": {},
-    }
-    docx_text = "商务投标文件封面\n投标人：示例科技有限责任司（盖单位公章）"
-
-    guarded = _apply_docx_stability_guards_from_text(report, docx_text)
-
-    assert any("有限责任司" in f["bid_evidence"] for f in guarded["findings"])

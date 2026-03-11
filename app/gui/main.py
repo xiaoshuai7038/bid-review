@@ -17,40 +17,58 @@ def _bootstrap_frozen_qt_runtime() -> None:
     if not getattr(sys, "frozen", False):
         return
 
-    search_roots = [
-        Path(getattr(sys, "_MEIPASS", "")),
-        Path(sys.executable).resolve().parent / "_internal",
-        Path(sys.executable).resolve().parent,
+    bundle_root = Path(getattr(sys, "_MEIPASS", "") or Path(sys.executable).resolve().parent / "_internal").resolve()
+    preferred_paths = [
+        bundle_root / "PySide6",
+        bundle_root / "shiboken6",
+        bundle_root / "PySide6" / "plugins",
+        bundle_root / "PySide6" / "plugins" / "platforms",
     ]
+
+    current_path_items = [item for item in os.environ.get("PATH", "").split(os.pathsep) if item]
+    filtered_path_items: list[str] = []
+    for item in current_path_items:
+        try:
+            if Path(item).resolve() == bundle_root:
+                continue
+        except OSError:
+            pass
+        filtered_path_items.append(item)
+
+    merged: list[str] = []
     seen: set[str] = set()
-    for root in search_roots:
-        if not root or not root.exists():
+    for item in [*(str(path) for path in preferred_paths if path.exists()), *filtered_path_items]:
+        key = item.lower()
+        if key in seen:
             continue
-        for candidate in [
-            root,
-            root / "PySide6",
-            root / "shiboken6",
-            root / "PySide6" / "plugins",
-            root / "PySide6" / "plugins" / "platforms",
-        ]:
-            if not candidate.exists():
-                continue
-            path_text = str(candidate.resolve())
-            if path_text in seen:
-                continue
-            seen.add(path_text)
-            try:
-                os.add_dll_directory(path_text)
-            except (AttributeError, FileNotFoundError, OSError):
-                pass
-    if seen:
-        os.environ["PATH"] = os.pathsep.join([*seen, os.environ.get("PATH", "")])
+        seen.add(key)
+        merged.append(item)
+    os.environ["PATH"] = os.pathsep.join(merged)
+
+    pyqt_root = bundle_root / "PySide6"
+    if pyqt_root.exists():
+        os.environ["QT_PLUGIN_PATH"] = str((pyqt_root / "plugins").resolve())
+        os.environ["QML2_IMPORT_PATH"] = str((pyqt_root / "qml").resolve())
+
+
+def _restore_frozen_runtime_root() -> None:
+    if not getattr(sys, "frozen", False):
+        return
+
+    bundle_root = Path(getattr(sys, "_MEIPASS", "") or Path(sys.executable).resolve().parent / "_internal").resolve()
+    current_path_items = [item for item in os.environ.get("PATH", "").split(os.pathsep) if item]
+    root_text = str(bundle_root)
+    if any(item.lower() == root_text.lower() for item in current_path_items):
+        return
+    os.environ["PATH"] = os.pathsep.join([root_text, *current_path_items])
 
 
 def main(argv: list[str] | None = None) -> int:
     _bootstrap_frozen_qt_runtime()
 
     from PySide6.QtCore import QTimer
+
+    _restore_frozen_runtime_root()
 
     from app.gui.app import create_application
     from app.gui.window import MainWindow

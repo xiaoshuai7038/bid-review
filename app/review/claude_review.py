@@ -51,6 +51,81 @@ _CONTEXT_REQUIREMENT_KEYWORDS = (
     "税号",
     "纳税人识别号",
 )
+_TEMPLATE_REQUIREMENT_RULES: list[dict[str, Any]] = [
+    {
+        "category": "响应格式",
+        "text": "第六章《投标文件格式》列示的经济投标文件、技术投标文件、商务投标文件组成项和必备文书必须完整提交，不得缺项漏项。",
+        "source_keywords": [
+            ("经济投标文件", "包括但不限于"),
+            ("技术投标文件", "包括但不限于"),
+            ("商务投标文件", "包括但不限于"),
+        ],
+        "match_keywords": [
+            ("经济投标文件", "技术投标文件", "商务投标文件"),
+            ("必备文书", "完整提交"),
+        ],
+    },
+    {
+        "category": "响应格式",
+        "text": "第六章模板文书中的收件人/抬头字段必须按模板填写对应对象；标注“招标人名称”的应填写招标人，标注“招标代理机构名称”的应填写招标代理机构，不得误填为投标人或其他单位。",
+        "source_keywords": [
+            ("致", "招标人名称"),
+            ("致", "招标代理机构名称"),
+        ],
+        "match_keywords": [
+            ("收件人", "抬头字段"),
+            ("招标人名称", "招标代理机构名称"),
+        ],
+    },
+    {
+        "category": "响应格式",
+        "text": "第六章模板中的项目名称、招标编号等项目标识字段必须与招标文件保持一致，不得错填、漏填或引用其他项目标识。",
+        "source_keywords": [
+            ("项目名称", "招标编号"),
+        ],
+        "match_keywords": [
+            ("项目名称", "招标编号", "项目标识"),
+        ],
+    },
+    {
+        "category": "响应格式",
+        "text": "第六章模板中的投标人、法定代表人/主要负责人、委托代理人等主体字段必须按角色准确填写，并在要求位置完成签字或盖章。",
+        "source_keywords": [
+            ("投标人", "盖公章"),
+            ("法定代表人", "委托代理人", "签字或盖章"),
+        ],
+        "match_keywords": [
+            ("投标人", "法定代表人", "委托代理人"),
+            ("签字", "盖章", "主体字段"),
+        ],
+    },
+    {
+        "category": "响应格式",
+        "text": "投标保证金交纳证明、基本账户开户许可证或基本账户证明中的金额、账户主体、账号、开户银行等字段必须按模板和前附表要求完整填写，并与基本账户及投标保证金要求保持一致。",
+        "source_keywords": [
+            ("投标保证金交纳证明",),
+            ("基本账户开户许可证或者基本账户证明",),
+            ("投标保证金", "基本账户"),
+        ],
+        "match_keywords": [
+            ("投标保证金", "基本账户"),
+            ("开户银行", "账号", "完整填写"),
+        ],
+    },
+    {
+        "category": "响应格式",
+        "text": "技术条款偏离表、商务条款偏离表必须按模板逐条填写偏离情况，并按要求标注“无偏离”“正偏离”或“负偏离”。",
+        "source_keywords": [
+            ("技术条款偏离表",),
+            ("商务条款偏离表",),
+            ("偏离情况", "无偏离"),
+        ],
+        "match_keywords": [
+            ("技术条款偏离表", "商务条款偏离表"),
+            ("偏离情况", "无偏离"),
+        ],
+    },
+]
 _CONTEXT_FINDING_KEYWORDS = (
     "主体",
     "错位",
@@ -329,7 +404,16 @@ def _strict_fail_on_forbidden_write() -> bool:
 
 
 def _local_semantic_guards_enabled() -> bool:
-    return os.getenv("BID_REVIEW_ENABLE_LOCAL_SEMANTIC_GUARDS", "0").strip().lower() in {
+    return os.getenv("BID_REVIEW_ENABLE_LOCAL_SEMANTIC_GUARDS", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _completion_gate_enabled() -> bool:
+    return os.getenv("BID_REVIEW_ENFORCE_COMPLETION_GATE", "1").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -586,6 +670,17 @@ def _looks_like_section_heading(text: str) -> bool:
     return False
 
 
+def _normalize_outline_title(text: str) -> str:
+    value = _clean_text(text)
+    if not value:
+        return ""
+    value = re.sub(r"\.{2,}\s*\d+\s*$", "", value).strip()
+    value = re.sub(r"\s+\d+\s*$", "", value).strip()
+    if re.fullmatch(r"\d+", value):
+        return ""
+    return value
+
+
 @lru_cache(maxsize=32)
 def _build_pdf_line_index(path_str: str) -> list[dict[str, Any]]:
     path = Path(path_str)
@@ -673,6 +768,292 @@ def _build_word_line_index(path_str: str) -> list[dict[str, Any]]:
             row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
             _push_line(row_text)
     return out
+
+
+def _collect_tender_outline(path: Path) -> dict[str, Any]:
+    line_index = _build_pdf_line_index(str(path.resolve()))
+    if not line_index:
+        return {"total_pages": 0, "sections": [], "relevant_sections": []}
+
+    total_pages = max(int(item.get("page_no", 0) or 0) for item in line_index)
+    seen: set[str] = set()
+    sections: list[dict[str, Any]] = []
+    extra_titles = {"投标人须知前附表", "评标办法前附表", "经济投标文件", "技术投标文件", "商务投标文件"}
+    for item in line_index:
+        text = _normalize_outline_title(str(item.get("text", "") or ""))
+        if not text or len(text) > 60:
+            continue
+        if not (_looks_like_section_heading(text) or text in extra_titles):
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        sections.append({"title": text, "page_no": int(item.get("page_no", 0) or 0)})
+        if len(sections) >= 40:
+            break
+
+    relevant_keywords = (
+        "投标人须知",
+        "投标文件格式",
+        "技术标准",
+        "技术要求",
+        "评标办法",
+        "资格",
+        "报价",
+        "服务",
+        "偏离表",
+        "保证金",
+        "开标一览表",
+        "分项报价表",
+        "投标函",
+    )
+    relevant_seen: set[str] = set()
+    relevant_sections: list[str] = []
+    for item in line_index:
+        text = _normalize_outline_title(str(item.get("text", "") or ""))
+        if not text:
+            continue
+        is_major_chapter = bool(re.match(r"^第[一二三四五六七八九十百0-9]+章", text))
+        is_extra_title = text in extra_titles
+        if not (is_major_chapter or is_extra_title):
+            continue
+        if not any(keyword in text for keyword in relevant_keywords):
+            continue
+        if text in relevant_seen:
+            continue
+        relevant_seen.add(text)
+        relevant_sections.append(text)
+    return {
+        "total_pages": total_pages,
+        "sections": sections,
+        "relevant_sections": relevant_sections,
+    }
+
+
+def _collect_bid_outline(path: Path) -> dict[str, Any]:
+    if path.suffix.lower() == ".docx":
+        line_index = _build_word_line_index(str(path.resolve()))
+        seen: set[str] = set()
+        sections: list[str] = []
+        for item in line_index:
+            section = _clean_text(str(item.get("section", "") or ""))
+            if not section or section in seen:
+                continue
+            seen.add(section)
+            sections.append(section)
+        template_sections = [section for section in sections if section in _SPECIAL_SECTION_TITLES]
+        return {
+            "sections": sections[:40],
+            "template_sections": template_sections,
+            "docx_image_count": _count_docx_embedded_images(path),
+        }
+
+    if path.suffix.lower() == ".pdf":
+        line_index = _build_pdf_line_index(str(path.resolve()))
+        seen: set[str] = set()
+        sections: list[str] = []
+        for item in line_index:
+            text = _clean_text(str(item.get("text", "") or ""))
+            if not text or len(text) > 60:
+                continue
+            if not _looks_like_section_heading(text):
+                continue
+            if text in seen:
+                continue
+            seen.add(text)
+            sections.append(text)
+        return {
+            "sections": sections[:40],
+            "template_sections": [],
+            "docx_image_count": 0,
+        }
+
+    return {"sections": [], "template_sections": [], "docx_image_count": 0}
+
+
+def _estimate_min_requirement_count(
+    *,
+    tender_outline: dict[str, Any],
+    bid_outline: dict[str, Any],
+) -> int:
+    relevant_tender = len(list(tender_outline.get("relevant_sections", [])))
+    template_sections = len(list(bid_outline.get("template_sections", [])))
+    section_count = len(list(bid_outline.get("sections", [])))
+    if relevant_tender <= 0 and template_sections <= 0 and section_count <= 0:
+        return 0
+    estimate = max(6, relevant_tender * 2, template_sections, min(12, section_count // 2))
+    return min(20, estimate)
+
+
+def _format_tender_outline_for_prompt(outline: dict[str, Any]) -> str:
+    total_pages = int(outline.get("total_pages", 0) or 0)
+    sections = list(outline.get("sections", []))
+    if not total_pages and not sections:
+        return "- 无法预提取招标文件结构，请自行先完成全文结构盘点后再开始提取 requirements。"
+    lines = [f"- 总页数: {total_pages}"]
+    if sections:
+        lines.append("- 检测到的章节/关键块:")
+        for item in sections[:20]:
+            title = str(item.get("title", "") or "")
+            page_no = int(item.get("page_no", 0) or 0)
+            lines.append(f"  - 第{page_no}页: {title}")
+    return "\n".join(lines)
+
+
+def _format_bid_outline_for_prompt(outline: dict[str, Any], *, bid_path: Path) -> str:
+    sections = list(outline.get("sections", []))
+    template_sections = list(outline.get("template_sections", []))
+    image_count = int(outline.get("docx_image_count", 0) or 0)
+    if not sections and bid_path.suffix.lower() != ".docx":
+        return "- 无法预提取投标文件结构，请自行先完成全文结构盘点后再开始逐条审查。"
+    lines: list[str] = []
+    if sections:
+        lines.append(f"- 检测到的正文/模板块数量: {len(sections)}")
+        lines.append("- 按出现顺序的章节/模板块（前40个）:")
+        for title in sections[:40]:
+            lines.append(f"  - {title}")
+    if bid_path.suffix.lower() == ".docx":
+        lines.append(f"- docx 内嵌图片数: {image_count}")
+        if template_sections:
+            lines.append("- 识别到的重点模板块:")
+            for title in template_sections[:20]:
+                lines.append(f"  - {title}")
+    return "\n".join(lines) if lines else "- 无法预提取投标文件结构，请自行先完成全文结构盘点。"
+
+
+def _extract_review_scope(raw_data: dict[str, Any]) -> dict[str, Any]:
+    summary = raw_data.get("summary", {})
+    if not isinstance(summary, dict):
+        return {}
+    review_scope = summary.get("review_scope", {})
+    return review_scope if isinstance(review_scope, dict) else {}
+
+
+def _normalize_scope_section_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        text = _clean_text(str(item or ""))
+        if text:
+            out.append(text)
+    return out
+
+
+def _count_scope_matches(expected: list[str], observed: list[str]) -> int:
+    if not expected or not observed:
+        return 0
+    observed_norm = [_normalize_search_text(x) for x in observed]
+    matched = 0
+    for item in expected:
+        norm = _normalize_search_text(item)
+        if any(norm and (norm in candidate or candidate in norm) for candidate in observed_norm):
+            matched += 1
+    return matched
+
+
+def _evaluate_review_completion(
+    raw_data: dict[str, Any],
+    *,
+    tender_outline: dict[str, Any],
+    bid_outline: dict[str, Any],
+    min_requirement_count: int,
+    require_word_extract: bool,
+    ocr_required: bool,
+) -> list[str]:
+    reasons: list[str] = []
+    has_expectation = bool(min_requirement_count) or bool(tender_outline.get("total_pages")) or bool(
+        bid_outline.get("sections")
+    ) or bool(bid_outline.get("docx_image_count"))
+    if not has_expectation:
+        return reasons
+    requirements = _normalize_requirements(raw_data.get("requirements"))
+    if min_requirement_count > 0 and len(requirements) < min_requirement_count:
+        reasons.append(
+            f"硬性要求仅提取到 {len(requirements)} 条，低于完成门槛 {min_requirement_count} 条。"
+        )
+
+    review_scope = _extract_review_scope(raw_data)
+    if not review_scope:
+        reasons.append("缺少 review_scope，无法证明已完成全文结构盘点和全文阅读。")
+        return reasons
+
+    if not bool(review_scope.get("completion_check_passed", False)):
+        reasons.append("review_scope.completion_check_passed 不是 true。")
+
+    tender_total_pages = int(tender_outline.get("total_pages", 0) or 0)
+    tender_pages_seen = int(review_scope.get("tender_total_pages_seen", 0) or 0)
+    if tender_total_pages and tender_pages_seen < tender_total_pages:
+        reasons.append(f"招标文件页数仅确认到 {tender_pages_seen}/{tender_total_pages} 页。")
+
+    tender_expected_sections = [str(x) for x in tender_outline.get("relevant_sections", [])]
+    tender_reviewed_sections = _normalize_scope_section_list(review_scope.get("tender_sections_reviewed"))
+    if tender_expected_sections:
+        required_matches = min(len(tender_expected_sections), max(3, len(tender_expected_sections) // 2))
+        actual_matches = _count_scope_matches(tender_expected_sections, tender_reviewed_sections)
+        if actual_matches < required_matches:
+            reasons.append(
+                f"招标文件关键章节覆盖不足，仅覆盖 {actual_matches}/{len(tender_expected_sections)} 个关键块。"
+            )
+
+    bid_expected_sections = [str(x) for x in bid_outline.get("template_sections") or bid_outline.get("sections", [])]
+    bid_reviewed_sections = _normalize_scope_section_list(review_scope.get("bid_sections_reviewed"))
+    if bid_expected_sections:
+        required_matches = min(len(bid_expected_sections), max(4, len(bid_expected_sections) // 2))
+        actual_matches = _count_scope_matches(bid_expected_sections, bid_reviewed_sections)
+        if actual_matches < required_matches:
+            reasons.append(
+                f"投标文件正文/模板块覆盖不足，仅覆盖 {actual_matches}/{len(bid_expected_sections)} 个关键块。"
+            )
+
+    image_count = int(bid_outline.get("docx_image_count", 0) or 0)
+    if require_word_extract and ocr_required and image_count > 0:
+        images_seen = int(review_scope.get("docx_image_count_seen", 0) or 0)
+        if images_seen < image_count:
+            reasons.append(f"docx 图片仅确认到 {images_seen}/{image_count} 张。")
+        if not bool(review_scope.get("docx_ocr_completed", False)):
+            reasons.append("review_scope.docx_ocr_completed 不是 true。")
+
+    return reasons
+
+
+def _append_completion_enforcement(
+    prompt: str,
+    *,
+    tender_document_map: str,
+    bid_document_map: str,
+    min_requirement_count: int,
+    reasons: list[str],
+) -> str:
+    reason_block = "\n".join(f"- {item}" for item in reasons[:8])
+    enforce = f"""
+
+[全文阅读完成门槛补充要求]
+你上一轮结果未通过完成门槛：
+{reason_block}
+
+请重新继续阅读，不要复用上一轮的半成品总结。你必须满足以下条件后才能输出最终 JSON：
+1. 先完成招标文件全文结构盘点，并确认总页数与关键章节覆盖。
+2. 再完成招标文件硬性要求全文提取；最终 `requirements` 不得少于 {min_requirement_count} 条，除非你已经读完整份文档且文档本身确实明显少于此数量。
+3. 再完成投标文件正文结构盘点；若是 docx，必须在全量 OCR 完成后重新回到正文和模板字段继续审查。
+4. 对已出现明确字段和值的位置（如 `致：`、`开户银行：`、`项目名称：`、`账号：`），必须先做字段级判断，禁止再输出泛化“需人工核验主体一致性/项目信息一致性”来代替。
+5. 你必须在 `summary.review_scope` 中如实返回：
+   - `tender_total_pages_seen`
+   - `tender_sections_reviewed`
+   - `bid_sections_reviewed`
+   - `docx_image_count_seen`
+   - `docx_ocr_completed`
+   - `completion_check_passed`
+
+重新审查时，请以以下结构地图为起点继续完成全文阅读：
+
+[招标文件结构地图]
+{tender_document_map}
+
+[投标文件结构地图]
+{bid_document_map}
+"""
+    return prompt + enforce
 
 
 def _extract_location_tokens(text: str) -> list[str]:
@@ -1075,6 +1456,107 @@ def _ensure_context_consistency_requirement(report: dict[str, Any]) -> dict[str,
     return report
 
 
+def _format_pdf_line_source(item: dict[str, Any]) -> str:
+    page_no = int(item.get("page_no", 0) or 0)
+    line_no = int(item.get("line_no", 0) or 0)
+    text = str(item.get("text", "") or "").strip()
+    return f"招标文件第{page_no}页 L{line_no}-L{line_no}：{text}"
+
+
+def _find_template_section_start_page(line_index: list[dict[str, Any]]) -> int:
+    for item in line_index:
+        text = str(item.get("text", "") or "")
+        if "第六章" in text and "投标文件格式" in text:
+            return int(item.get("page_no", 0) or 0)
+    return 0
+
+
+def _requirement_matches_keyword_groups(
+    requirements: list[dict[str, Any]],
+    keyword_groups: list[tuple[str, ...]],
+) -> bool:
+    for req in requirements:
+        if not isinstance(req, dict):
+            continue
+        blob = " ".join(
+            str(req.get(key, "") or "")
+            for key in ("category", "text", "source")
+        )
+        if _match_text_by_keyword_groups(blob, keyword_groups):
+            return True
+    return False
+
+
+def _find_requirement_source_from_tender(
+    line_index: list[dict[str, Any]],
+    keyword_groups: list[tuple[str, ...]],
+    *,
+    min_page: int = 0,
+) -> str:
+    for group in keyword_groups:
+        keys = tuple(_normalize_search_text(x) for x in group if x)
+        if not keys:
+            continue
+        for item in line_index:
+            if min_page and int(item.get("page_no", 0) or 0) < min_page:
+                continue
+            norm = str(item.get("norm", "") or "")
+            if all(key in norm for key in keys):
+                return _format_pdf_line_source(item)
+    return ""
+
+
+def _ensure_template_field_requirements(
+    report: dict[str, Any],
+    *,
+    tender_path: Path,
+) -> dict[str, Any]:
+    requirements_raw = report.get("requirements", [])
+    requirements = requirements_raw if isinstance(requirements_raw, list) else []
+    if tender_path.suffix.lower() != ".pdf":
+        return report
+    tender_index = _build_pdf_line_index(str(tender_path.resolve()))
+    if not tender_index:
+        return report
+
+    start_page = _find_template_section_start_page(tender_index)
+    if start_page <= 0:
+        return report
+
+    changed = False
+    for rule in _TEMPLATE_REQUIREMENT_RULES:
+        match_keywords = list(rule.get("match_keywords", []))
+        if _requirement_matches_keyword_groups(requirements, match_keywords):
+            continue
+        source = _find_requirement_source_from_tender(
+            tender_index,
+            list(rule.get("source_keywords", [])),
+            min_page=start_page,
+        )
+        if not source:
+            continue
+        requirements.append(
+            {
+                "id": f"R{len(requirements) + 1:03d}",
+                "category": str(rule.get("category", "响应格式")),
+                "text": str(rule.get("text", "")),
+                "source": source,
+            }
+        )
+        changed = True
+
+    if not changed:
+        return report
+
+    report["requirements"] = requirements
+    summary = report.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+        report["summary"] = summary
+    summary["requirement_count"] = len(requirements)
+    return report
+
+
 def _is_context_consistency_finding(finding: dict[str, Any]) -> bool:
     text = _compact_token_text(
         " ".join(
@@ -1233,6 +1715,187 @@ def _pick_requirement_id(report: dict[str, Any], candidates: list[str]) -> str:
         if rid and rid in valid_ids:
             return rid
     return valid_ids[0] if valid_ids else ""
+
+
+def _extract_tender_party_baselines(tender_path: Path | None) -> dict[str, set[str]]:
+    out: dict[str, set[str]] = {"owner": set(), "agency": set()}
+    if tender_path is None or tender_path.suffix.lower() != ".pdf":
+        return out
+    line_index = _build_pdf_line_index(str(tender_path.resolve()))
+    if not line_index:
+        return out
+
+    label_specs = (
+        ("owner", ("招标人", "采购人")),
+        ("agency", ("招标代理机构",)),
+    )
+    for item in line_index:
+        compact_line = re.sub(r"\s+", "", str(item.get("text", "") or ""))
+        if not compact_line:
+            continue
+        for key, labels in label_specs:
+            for label in labels:
+                match = re.search(rf"{re.escape(label)}[:：](.+)", compact_line)
+                if not match:
+                    continue
+                normalized = _compact_token_text(_normalize_semantic_field_value(match.group(1)))
+                if len(normalized) >= 4:
+                    out[key].add(normalized)
+    return out
+
+
+def _assign_finding_ids(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for idx, item in enumerate(findings, start=1):
+        if not isinstance(item, dict):
+            continue
+        current = dict(item)
+        current["id"] = f"F{idx:03d}"
+        out.append(current)
+    return out
+
+
+def _normalize_semantic_field_value(value: Any) -> str:
+    text = str(value or "").strip()
+    text = re.split(r"[\r\n]", text, maxsplit=1)[0]
+    text = re.sub(r"[（(](?:盖[^）)]*|签[^）)]*|签章[^）)]*|公章[^）)]*)[）)]\s*$", "", text)
+    text = re.split(r"(?:联系人|联系电话|地址|电话|邮编|备注)\s*[:：]", text, maxsplit=1)[0]
+    text = text.strip("`'\"：:，,。.;； ")
+    return re.sub(r"\s+", "", text)
+
+
+def _extract_labeled_field_entries(text: str, labels: tuple[str, ...]) -> list[dict[str, str]]:
+    if not text or not labels:
+        return []
+    label_group = "|".join(re.escape(label) for label in sorted(labels, key=len, reverse=True))
+    pattern = re.compile(
+        rf"(?:^|[|｜])\s*(?P<label>{label_group})\s*[:：]?\s*(?P<value>[^\r\n|｜]{{1,120}})",
+        flags=re.IGNORECASE,
+    )
+    out: list[dict[str, str]] = []
+    for raw_line in str(text).splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        for match in pattern.finditer(line):
+            value = _normalize_semantic_field_value(match.group("value"))
+            if len(value) < 2:
+                continue
+            out.append(
+                {
+                    "label": str(match.group("label")).strip(),
+                    "value": value,
+                    "line": line,
+                }
+            )
+    return out
+
+
+def _looks_like_bank_name(value: str) -> bool:
+    compact = _compact_token_text(value)
+    keywords = (
+        "银行",
+        "信用社",
+        "信用联社",
+        "农商银行",
+        "农商行",
+        "农村商业银行",
+        "村镇银行",
+        "支行",
+        "分行",
+        "营业部",
+    )
+    return any(keyword in compact for keyword in keywords)
+
+
+def _looks_like_company_name(value: str, entity_names: set[str] | None = None) -> bool:
+    compact = _compact_token_text(value)
+    if not compact:
+        return False
+    entity_names = entity_names or set()
+    if compact in entity_names:
+        return True
+    if _looks_like_bank_name(value):
+        return False
+    keywords = (
+        "有限责任公司",
+        "股份有限公司",
+        "有限公司",
+        "公司",
+        "集团",
+        "研究院",
+        "研究所",
+        "中心",
+        "事务所",
+        "分公司",
+        "合作社",
+        "协会",
+        "基金会",
+        "招标",
+        "咨询",
+        "工程",
+        "科技",
+        "服务",
+        "贸易",
+        "建设",
+        "实业",
+    )
+    return any(_compact_token_text(keyword) in compact for keyword in keywords)
+
+
+def _looks_like_person_name(value: str) -> bool:
+    compact = _compact_token_text(value)
+    if not compact:
+        return False
+    if any(ch.isdigit() for ch in compact):
+        return False
+    if _looks_like_bank_name(value):
+        return False
+    if _looks_like_company_name(value):
+        return False
+    candidate = re.sub(r"[·•．.]", "", str(value or "").strip())
+    return bool(re.fullmatch(r"[\u4e00-\u9fff]{2,8}", candidate))
+
+
+def _looks_like_account_number(value: str) -> bool:
+    compact = re.sub(r"[\s\-]", "", str(value or "").upper())
+    if re.fullmatch(r"\d{8,30}", compact):
+        return True
+    if re.fullmatch(r"[0-9A-Z]{12,30}", compact) and sum(ch.isdigit() for ch in compact) >= 8:
+        return True
+    return False
+
+
+def _looks_like_credit_code(value: str) -> bool:
+    compact = re.sub(r"\s+", "", str(value or "").upper())
+    return bool(re.fullmatch(r"[0-9A-Z]{18}", compact)) and any(ch.isalpha() for ch in compact)
+
+
+def _looks_like_tax_identifier(value: str) -> bool:
+    compact = re.sub(r"\s+", "", str(value or "").upper())
+    if _looks_like_credit_code(compact):
+        return True
+    if not re.fullmatch(r"[0-9A-Z]{15,20}", compact):
+        return False
+    if _looks_like_account_number(compact):
+        return False
+    return any(ch.isalpha() for ch in compact)
+
+
+def _classify_semantic_field_value(value: str, *, entity_names: set[str]) -> str:
+    if _looks_like_bank_name(value):
+        return "bank_name"
+    if _looks_like_credit_code(value):
+        return "credit_code"
+    if _looks_like_tax_identifier(value):
+        return "tax_id"
+    if _looks_like_account_number(value):
+        return "account_no"
+    if _looks_like_person_name(value):
+        return "person_name"
+    if _looks_like_company_name(value, entity_names):
+        return "company_name"
+    return "unknown"
 
 
 def _match_text_by_keyword_groups(text: str, keyword_groups: list[tuple[str, ...]]) -> bool:
@@ -1545,6 +2208,24 @@ def _finding_quality_score(item: dict[str, Any]) -> int:
     return score
 
 
+def _should_preserve_non_theme_finding(item: dict[str, Any]) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if str(item.get("status", "")).strip() != "non_compliant":
+        return False
+    merged_text = " ".join(
+        str(item.get(k, "") or "")
+        for k in ("issue", "tender_evidence", "bid_evidence", "recommendation")
+    )
+    return _match_text_by_keyword_groups(
+        merged_text,
+        [
+            ("字段语义不符",),
+            ("收件人", "抬头字段"),
+        ],
+    )
+
+
 def _theme_requirement_candidates(report: dict[str, Any]) -> dict[str, str]:
     requirements = report.get("requirements", [])
     if not isinstance(requirements, list):
@@ -1633,6 +2314,9 @@ def _stabilize_findings(report: dict[str, Any]) -> dict[str, Any]:
             item["requirement_id"] = rid
         merged.append(item)
 
+    preserved_other = [item for item in other if _should_preserve_non_theme_finding(item)]
+    merged.extend(preserved_other)
+
     keep_non_theme = os.getenv("BID_REVIEW_KEEP_NON_THEME_FINDINGS", "0").strip().lower() in {
         "1",
         "true",
@@ -1642,6 +2326,8 @@ def _stabilize_findings(report: dict[str, Any]) -> dict[str, Any]:
     if keep_non_theme:
         # 可选：保留非主题项用于人工深挖，默认关闭以确保结果稳定。
         for item in other:
+            if item in preserved_other:
+                continue
             status = str(item.get("status", "")).strip()
             if status == "non_compliant":
                 merged.append(item)
@@ -1658,6 +2344,7 @@ def _apply_docx_stability_guards_from_text(
     report: dict[str, Any],
     docx_text: str,
     *,
+    tender_path: Path | None = None,
     force_manual_image_checks: bool = False,
 ) -> dict[str, Any]:
     def _normalize_labeled_party(value: str) -> str:
@@ -1681,8 +2368,42 @@ def _apply_docx_stability_guards_from_text(
                 out.add(normalized)
         return out
 
+    def _normalize_section_title(value: str) -> str:
+        text = _clean_text(value)
+        text = re.sub(r"^[一二三四五六七八九十]+、\s*", "", text)
+        text = re.sub(r"^\d+(?:\.\d+){0,3}[、.．]?\s*", "", text)
+        return text.strip()
+
+    def _split_docx_sections(text: str) -> dict[str, str]:
+        sections: dict[str, list[str]] = {}
+        current_title = ""
+        current_lines: list[str] = []
+        for raw_line in str(text).splitlines():
+            line = _clean_text(raw_line)
+            if not line:
+                continue
+            normalized_title = _normalize_section_title(line)
+            is_heading = normalized_title in _SPECIAL_SECTION_TITLES or _looks_like_section_heading(line)
+            if is_heading:
+                if current_title and current_lines and current_title not in sections:
+                    sections[current_title] = list(current_lines)
+                current_title = normalized_title
+                current_lines = [line]
+                continue
+            if current_title:
+                current_lines.append(line)
+        if current_title and current_lines and current_title not in sections:
+            sections[current_title] = list(current_lines)
+        return {title: "\n".join(lines) for title, lines in sections.items()}
+
     if not docx_text:
         return report
+
+    original_non_theme_findings = [
+        dict(item)
+        for item in report.get("findings", [])
+        if isinstance(item, dict) and _theme_match_rule(item) is None
+    ]
 
     requirements = report.get("requirements", [])
     if not isinstance(requirements, list):
@@ -1795,6 +2516,193 @@ def _apply_docx_stability_guards_from_text(
         return fallback
 
     compact = _compact_token_text(docx_text)
+    bidder_entity_names = _extract_labeled_parties(
+        docx_text,
+        ("投标人", "供应商", "申请人", "投标单位", "供应商名称"),
+    )
+    tender_party_baselines = _extract_tender_party_baselines(tender_path)
+    section_blocks = _split_docx_sections(docx_text)
+
+    semantic_specs = [
+        {
+            "labels": ("开户银行", "开户行", "基本账户开户银行", "银行名称"),
+            "expected_kind": "bank_name",
+            "expected_desc": "银行机构名称",
+            "requirement_id": bank_req_id,
+            "fallback_tender": "开户银行字段应填写银行机构名称，并与基本账户信息保持一致。",
+            "recommendation": "将{label}更正为开户银行全称或开户支行名称，并同步复核账户名、账号和基本账户证明。",
+        },
+        {
+            "labels": ("账户名", "账户名称", "户名", "基本账户名称"),
+            "expected_kind": "account_name",
+            "expected_desc": "账户主体名称",
+            "requirement_id": bank_req_id,
+            "fallback_tender": "账户名字段应填写账户主体名称，并与基本账户信息保持一致。",
+            "recommendation": "将{label}更正为账户主体名称，并与营业执照、基本账户证明保持一致。",
+        },
+        {
+            "labels": ("账号", "银行账号", "账户账号", "基本账户账号", "银行账户号"),
+            "expected_kind": "account_no",
+            "expected_desc": "账号串",
+            "requirement_id": bank_req_id,
+            "fallback_tender": "账号字段应填写有效账号信息，并与基本账户证明保持一致。",
+            "recommendation": "将{label}更正为有效账号，并逐位复核与银行证明、转账凭证一致。",
+        },
+        {
+            "labels": ("法定代表人", "法人代表"),
+            "expected_kind": "person_name",
+            "expected_desc": "自然人姓名",
+            "requirement_id": sign_req_id,
+            "fallback_tender": "法定代表人字段应填写自然人姓名，并与授权签署信息保持一致。",
+            "recommendation": "将{label}更正为法定代表人姓名，并统一复核授权委托书、签字页和营业执照信息。",
+        },
+        {
+            "labels": ("授权代表", "委托代理人", "授权委托人", "被授权人", "代理人"),
+            "expected_kind": "person_name",
+            "expected_desc": "自然人姓名",
+            "requirement_id": sign_req_id,
+            "fallback_tender": "授权代表字段应填写自然人姓名，并与授权委托信息保持一致。",
+            "recommendation": "将{label}更正为被授权自然人姓名，并复核授权委托页和签字盖章页信息。",
+        },
+        {
+            "labels": ("统一社会信用代码", "社会信用代码"),
+            "expected_kind": "credit_code",
+            "expected_desc": "统一社会信用代码格式",
+            "requirement_id": context_req_id,
+            "fallback_tender": "统一社会信用代码字段应填写合法代码格式，并与主体证照一致。",
+            "recommendation": "将{label}更正为营业执照一致的统一社会信用代码，并复核全文主体代码信息。",
+        },
+        {
+            "labels": ("税号", "纳税人识别号"),
+            "expected_kind": "tax_id",
+            "expected_desc": "税号格式",
+            "requirement_id": context_req_id,
+            "fallback_tender": "税号字段应填写合法税务识别代码，并与主体税务信息一致。",
+            "recommendation": "将{label}更正为有效税务识别代码，并复核报价税务信息与主体证照一致。",
+        },
+    ]
+
+    observed_desc_map = {
+        "bank_name": "银行机构名称",
+        "company_name": "单位名称",
+        "person_name": "自然人姓名",
+        "account_no": "账号格式",
+        "credit_code": "统一社会信用代码格式",
+        "tax_id": "税号格式",
+        "unknown": "普通文本",
+    }
+
+    receiver_specs = [
+        {
+            "section_titles": ("投标函", "资格审查申请书", "关于行贿等黑名单行为的专项承诺函"),
+            "expected_names": tender_party_baselines["owner"],
+            "expected_desc": "招标人名称",
+            "requirement_id": format_req_id,
+            "fallback_tender": "第六章模板文书中的收件人/抬头字段应按模板填写招标人名称，不得误填为投标人或其他单位。",
+            "recommendation": "将《{section}》中的收件人字段更正为招标人全称，并复核同类模板文书抬头是否一致。",
+        },
+        {
+            "section_titles": ("投标保证金交纳证明",),
+            "expected_names": tender_party_baselines["agency"],
+            "expected_desc": "招标代理机构名称",
+            "requirement_id": bank_req_id,
+            "fallback_tender": "投标保证金交纳证明中的收件人字段应按模板填写招标代理机构名称，不得误填为投标人或其他单位。",
+            "recommendation": "将《{section}》中的收件人字段更正为招标代理机构全称，并复核保证金证明其余字段。",
+        },
+    ]
+
+    for spec in receiver_specs:
+        expected_names = {str(x) for x in spec["expected_names"] if x}
+        if not expected_names:
+            continue
+        for section_title in spec["section_titles"]:
+            section_text = section_blocks.get(section_title, "")
+            if not section_text:
+                continue
+            for entry in _extract_labeled_field_entries(section_text, ("致",)):
+                value = entry["value"]
+                compact_value = _compact_token_text(value)
+                if not compact_value or compact_value in expected_names:
+                    continue
+                actual_desc = "投标人名称" if compact_value in bidder_entity_names else "其他单位名称"
+                requirement_id = _pick_requirement_id(
+                    report,
+                    [str(spec["requirement_id"]), format_req_id, context_req_id],
+                )
+                _upsert_guard_finding(
+                    report,
+                    requirement_id=requirement_id,
+                    status="non_compliant",
+                    issue=(
+                        f"《{section_title}》中的收件人/抬头字段“致”应填写{spec['expected_desc']}，"
+                        f"当前填写“{value}”，实际呈现为{actual_desc}，与文书角色不一致。"
+                    ),
+                    tender_evidence=tender_evidence_for(
+                        requirement_id,
+                        str(spec["fallback_tender"]),
+                    ),
+                    bid_evidence=(
+                        f"文内字段校验：检测到《{section_title}》中“{entry['line']}”，"
+                        f"其收件人字段填写为“{value}”，未与模板要求的{spec['expected_desc']}保持一致。"
+                    ),
+                    recommendation=str(spec["recommendation"]).format(section=section_title),
+                    match_groups=[
+                        (section_title, "收件人", "抬头字段"),
+                        (section_title, "致", spec["expected_desc"]),
+                    ],
+                )
+
+    for spec in semantic_specs:
+        expected_kind = str(spec["expected_kind"])
+        labels = tuple(str(x) for x in spec["labels"])
+        for entry in _extract_labeled_field_entries(docx_text, labels):
+            label = entry["label"]
+            value = entry["value"]
+            observed_kind = _classify_semantic_field_value(value, entity_names=bidder_entity_names)
+            if expected_kind == "bank_name":
+                matches = _looks_like_bank_name(value)
+            elif expected_kind == "account_name":
+                matches = _looks_like_company_name(value, bidder_entity_names) or _looks_like_person_name(value)
+            elif expected_kind == "account_no":
+                matches = _looks_like_account_number(value)
+            elif expected_kind == "person_name":
+                matches = _looks_like_person_name(value)
+            elif expected_kind == "credit_code":
+                matches = _looks_like_credit_code(value)
+            elif expected_kind == "tax_id":
+                matches = _looks_like_tax_identifier(value)
+            else:
+                matches = True
+            if matches or observed_kind == "unknown":
+                continue
+
+            same_as_bidder = _compact_token_text(value) in bidder_entity_names
+            bidder_hint = "，且与投标人主体名称重合" if same_as_bidder else ""
+            requirement_id = _pick_requirement_id(report, [str(spec["requirement_id"]), context_req_id, format_req_id])
+            issue = (
+                f"字段“{label}”应填写{spec['expected_desc']}，当前填写“{value}”，"
+                f"实际呈现为{observed_desc_map.get(observed_kind, '普通文本')}，字段语义不符。"
+            )
+            bid_evidence = (
+                f"文内字段校验：检测到“{entry['line']}”，其中“{label}”字段值“{value}”呈现为"
+                f"{observed_desc_map.get(observed_kind, '普通文本')}{bidder_hint}。"
+            )
+            _upsert_guard_finding(
+                report,
+                requirement_id=requirement_id,
+                status="non_compliant",
+                issue=issue,
+                tender_evidence=tender_evidence_for(
+                    requirement_id,
+                    str(spec["fallback_tender"]),
+                ),
+                bid_evidence=bid_evidence,
+                recommendation=str(spec["recommendation"]).format(label=label),
+                match_groups=[
+                    (label, "字段语义不符"),
+                    (label, spec["expected_desc"]),
+                ],
+            )
 
     # 1) 投标函落款主体错位（明确不符合）
     tender_party_names = _extract_labeled_parties(docx_text, ("招标人", "采购人"))
@@ -2008,29 +2916,23 @@ def _apply_docx_stability_guards_from_text(
 
     report["findings"] = _dedupe_findings(report.get("findings", []))
     _refresh_summary(report)
-    return _stabilize_findings(report)
+    report = _stabilize_findings(report)
+    if original_non_theme_findings:
+        report["findings"] = _dedupe_findings(report.get("findings", []) + original_non_theme_findings)
+        _refresh_summary(report)
+    return report
 
 
 def _apply_stability_guards(
     report: dict[str, Any],
     *,
+    tender_path: Path,
     bid_path: Path,
     force_manual_image_checks: bool = False,
 ) -> dict[str, Any]:
-    report["findings"] = _dedupe_findings(report.get("findings", []))
+    report["findings"] = _assign_finding_ids(report.get("findings", []))
     _refresh_summary(report)
-    if not _local_semantic_guards_enabled():
-        return report
-    if bid_path.suffix.lower() != ".docx":
-        return report
-    text = _extract_docx_text(bid_path)
-    if not text:
-        return report
-    return _apply_docx_stability_guards_from_text(
-        report,
-        text,
-        force_manual_image_checks=force_manual_image_checks,
-    )
+    return report
 
 
 def _parse_review_report_from_raw(
@@ -2061,14 +2963,6 @@ def _parse_review_report_from_raw(
             raise ValueError(f"{backend_name} 返回缺少关键字段: {key}")
 
     report = normalize_review_report(data)
-    report = _ensure_context_consistency_requirement(report)
-    valid_req_ids = {str(r.get("id", "")) for r in report.get("requirements", [])}
-    context_req_id = _find_context_requirement_id(report.get("requirements", []))
-    report["findings"] = _bind_findings_to_context_requirement(
-        report.get("findings", []),
-        valid_req_ids=valid_req_ids,
-        context_req_id=context_req_id,
-    )
     report = _enrich_report_evidence_locations(
         report,
         tender_path=tender_path,
@@ -2176,6 +3070,20 @@ def run_bid_review_with_claude(
     workspace_dir = prompt_safe_path(str(tender_path_obj.parent))
     tender_stem = tender_path_obj.stem
     bid_stem = bid_path_obj.stem
+    tender_outline = _collect_tender_outline(tender_path_obj)
+    bid_outline = _collect_bid_outline(bid_path_obj)
+    min_requirement_count = _estimate_min_requirement_count(
+        tender_outline=tender_outline,
+        bid_outline=bid_outline,
+    )
+    tender_document_map = compact_text_for_prompt(
+        _format_tender_outline_for_prompt(tender_outline),
+        3000,
+    )
+    bid_document_map = compact_text_for_prompt(
+        _format_bid_outline_for_prompt(bid_outline, bid_path=bid_path_obj),
+        4000,
+    )
     instruction = compact_text_for_prompt(extra_instruction.strip(), 2000) if extra_instruction else "无"
     user_ins = compact_text_for_prompt(user_instruction.strip(), 2000) if user_instruction else "无"
     prompt = render_prompt(
@@ -2187,6 +3095,9 @@ def run_bid_review_with_claude(
         bid_path=str(bid_path_obj),
         user_instruction=user_ins,
         instruction=instruction,
+        tender_document_map=tender_document_map,
+        bid_document_map=bid_document_map,
+        minimum_requirement_count=str(min_requirement_count),
     )
     require_word_extract = bid_path_obj.suffix.lower() == ".docx"
     ocr_required = _instruction_requires_ocr(user_instruction, extra_instruction) or (
@@ -2261,6 +3172,51 @@ def run_bid_review_with_claude(
                 tender_path=tender_path_obj,
                 bid_path=bid_path_obj,
             )
+            if _completion_gate_enabled():
+                raw_data = extract_json_payload(raw_output)
+                completion_failures = _evaluate_review_completion(
+                    raw_data,
+                    tender_outline=tender_outline,
+                    bid_outline=bid_outline,
+                    min_requirement_count=min_requirement_count,
+                    require_word_extract=require_word_extract,
+                    ocr_required=ocr_required,
+                )
+                if completion_failures:
+                    completion_retry_prompt = _append_completion_enforcement(
+                        prompt,
+                        tender_document_map=tender_document_map,
+                        bid_document_map=bid_document_map,
+                        min_requirement_count=min_requirement_count,
+                        reasons=completion_failures,
+                    )
+                    completion_retry_raw = client.ask_text(
+                        completion_retry_prompt,
+                        task_label=f"初审重试(全文完成门槛)：{bid_path_obj.name}",
+                    )
+                    report, completion_retry_raw = _parse_review_report_from_raw(
+                        raw_output=completion_retry_raw,
+                        prompt=completion_retry_prompt,
+                        client=client,
+                        backend_name=backend_name,
+                        tender_path=tender_path_obj,
+                        bid_path=bid_path_obj,
+                    )
+                    raw_data = extract_json_payload(completion_retry_raw)
+                    retry_completion_failures = _evaluate_review_completion(
+                        raw_data,
+                        tender_outline=tender_outline,
+                        bid_outline=bid_outline,
+                        min_requirement_count=min_requirement_count,
+                        require_word_extract=require_word_extract,
+                        ocr_required=ocr_required,
+                    )
+                    if retry_completion_failures:
+                        raise ClaudeCallError(
+                            "审查结果未满足全文阅读完成门槛："
+                            + "；".join(retry_completion_failures)
+                        )
+                    raw_output = f"{raw_output}\n\n[COMPLETION_RETRY]\n{completion_retry_raw}"
             location_gaps = _find_precise_location_gaps(report, bid_path=bid_path_obj)
             if location_gaps:
                 location_retry_prompt = _append_precise_location_enforcement(
@@ -2320,6 +3276,7 @@ def run_bid_review_with_claude(
     if not enable_second_pass:
         report = _apply_stability_guards(
             report,
+            tender_path=tender_path_obj,
             bid_path=bid_path_obj,
             force_manual_image_checks=force_manual_image_checks,
         )
@@ -2353,15 +3310,6 @@ def run_bid_review_with_claude(
     except Exception:  # noqa: BLE001
         add_findings = []
     if add_findings:
-        # 二次复核只允许引用初审已存在的 requirement_id，防止凭空新增 R041+。
-        valid_req_ids = {str(r.get("id", "")) for r in report.get("requirements", [])}
-        context_req_id = _find_context_requirement_id(report.get("requirements", []))
-        add_findings = _bind_findings_to_context_requirement(
-            add_findings,
-            valid_req_ids=valid_req_ids,
-            context_req_id=context_req_id,
-        )
-        add_findings = [f for f in add_findings if str(f.get("requirement_id", "")) in valid_req_ids]
         temp_report = _enrich_report_evidence_locations(
             {"findings": add_findings},
             tender_path=tender_path_obj,
@@ -2369,19 +3317,13 @@ def run_bid_review_with_claude(
         )
         add_findings = temp_report.get("findings", add_findings)
     if add_findings:
-        report["findings"] = _dedupe_findings(report["findings"] + add_findings)
-        report["summary"]["non_compliant_count"] = sum(
-            1 for f in report["findings"] if f["status"] == "non_compliant"
-        )
-        report["summary"]["risk_count"] = sum(1 for f in report["findings"] if f["status"] == "risk")
-        report["summary"]["needs_manual_count"] = sum(
-            1 for f in report["findings"] if f["status"] == "needs_manual"
-        )
-        report["summary"]["finding_count"] = len(report["findings"])
+        report["findings"] = _assign_finding_ids(report["findings"] + add_findings)
+        _refresh_summary(report)
 
     # 稳定性兜底：对可确定的不符合项做规则化补齐/归一，降低多次运行抖动。
     report = _apply_stability_guards(
         report,
+        tender_path=tender_path_obj,
         bid_path=bid_path_obj,
         force_manual_image_checks=force_manual_image_checks,
     )

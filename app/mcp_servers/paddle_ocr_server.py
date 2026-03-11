@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 from dataclasses import asdict, dataclass
@@ -14,6 +15,12 @@ from mcp.server.fastmcp import FastMCP
 
 DEFAULT_OCR_BACKEND_URL = "https://u372299-h9rw-37d89577.westd.seetacloud.com:8443"
 IMAGE_EXTENSIONS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+_TEXT_PRIORITY_KEYS = ("text", "content", "value", "markdown", "md", "plain_text")
+_INLINE_METADATA_PATTERNS = (
+    re.compile(r"(?<!\S)/root(?:/[^\s]+)*(?=\s|$)"),
+    re.compile(r"(?<!\S)min/general/[A-Za-z0-9._-]+(?=\s|$)"),
+)
+_LEADING_METADATA_LINES = {"min", "general", "document"}
 
 mcp = FastMCP(name="paddle-ocr", instructions="项目内置 OCR MCP bridge，调用统一远端 OCR 服务。")
 
@@ -108,6 +115,86 @@ def _preview_results(results: list[OCRFileResult], limit: int = 5) -> list[dict[
     return preview
 
 
+def _sanitize_ocr_text_line(line: str) -> str:
+    cleaned = line.strip()
+    for pattern in _INLINE_METADATA_PATTERNS:
+        cleaned = pattern.sub(" ", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" \t|,:;[](){}<>")
+    if not re.search(r"[\w\u4e00-\u9fff]", cleaned):
+        return ""
+    return cleaned
+
+
+def _is_leading_metadata_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if stripped.lower() in _LEADING_METADATA_LINES:
+        return True
+    return any(pattern.fullmatch(stripped) for pattern in _INLINE_METADATA_PATTERNS)
+
+
+def _join_ocr_text_fragments(fragments: list[str]) -> str:
+    lines: list[str] = []
+    last_line = ""
+    for fragment in fragments:
+        raw_lines = fragment.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        start_index = 0
+        while start_index < len(raw_lines) and _is_leading_metadata_line(raw_lines[start_index]):
+            start_index += 1
+        for raw_line in raw_lines[start_index:]:
+            cleaned_line = _sanitize_ocr_text_line(raw_line)
+            if not cleaned_line or cleaned_line == last_line:
+                continue
+            lines.append(cleaned_line)
+            last_line = cleaned_line
+    return "\n".join(lines).strip()
+
+
+def _extract_ocr_text_fragments(payload: Any) -> list[str]:
+    if payload is None:
+        return []
+    if isinstance(payload, str):
+        return [payload]
+    if isinstance(payload, dict):
+        prioritized: list[str] = []
+        saw_priority_key = False
+        for key in _TEXT_PRIORITY_KEYS:
+            if key in payload:
+                saw_priority_key = True
+                prioritized.extend(_extract_ocr_text_fragments(payload.get(key)))
+        if prioritized:
+            return prioritized
+        if saw_priority_key:
+            return []
+        fragments: list[str] = []
+        for value in payload.values():
+            fragments.extend(_extract_ocr_text_fragments(value))
+        return fragments
+    if isinstance(payload, (list, tuple, set)):
+        fragments: list[str] = []
+        for item in payload:
+            fragments.extend(_extract_ocr_text_fragments(item))
+        return fragments
+    return []
+
+
+def _extract_clean_ocr_text(payload: Any) -> str:
+    return _join_ocr_text_fragments(_extract_ocr_text_fragments(payload))
+
+
+def _resolve_result_source_path(result_item: dict[str, Any], client_path: Path | None) -> str:
+    client_source = str(result_item.get("client_path") or "").strip()
+    if client_source:
+        return client_source
+    if client_path is not None:
+        return str(client_path)
+    backend_source = str(result_item.get("source_path") or "").strip()
+    if backend_source.startswith("/root/"):
+        return ""
+    return backend_source
+
+
 def _batch_ocr_images(paths: list[Path], *, chunk_size: int | None = None) -> dict[str, Any]:
     if not paths:
         return {"summary": {"total_files": 0, "succeeded": 0, "failed": 0}, "results": []}
@@ -133,12 +220,13 @@ def _batch_ocr_images(paths: list[Path], *, chunk_size: int | None = None) -> di
                     for handle in handles:
                         handle.close()
 
-            for item in payload.get("results", []):
+            for index, item in enumerate(payload.get("results", [])):
+                client_path = chunk[index] if index < len(chunk) else None
                 all_results.append(
                     OCRFileResult(
-                        source_path=str(item.get("source_path", "")),
+                        source_path=_resolve_result_source_path(item, client_path),
                         success=bool(item.get("success")),
-                        text=item.get("text"),
+                        text=_extract_clean_ocr_text(item.get("text")),
                         error=item.get("error"),
                         elapsed_ms=item.get("elapsed_ms"),
                     )
@@ -154,7 +242,7 @@ def _batch_ocr_images(paths: list[Path], *, chunk_size: int | None = None) -> di
 def _ocr_text_from_single_result(result_payload: dict[str, Any]) -> str:
     for item in result_payload.get("results", []):
         if item.get("success"):
-            text = str(item.get("text") or "").strip()
+            text = _extract_clean_ocr_text(item.get("text"))
             if text:
                 return text
         error = str(item.get("error") or "").strip()
@@ -231,7 +319,7 @@ def _ocr_pdf_file(file_path: str, language: str = "ch") -> str:
         payload = _batch_ocr_images(image_paths)
         lines: list[str] = []
         for index, item in enumerate(payload.get("results", []), start=1):
-            text = str(item.get("text") or "").strip()
+            text = _extract_clean_ocr_text(item.get("text"))
             if not text:
                 text = str(item.get("error") or "[未识别到文字]")
             lines.append(f"第{index}页（图片OCR）:\n{text}\n")
