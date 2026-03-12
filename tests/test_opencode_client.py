@@ -41,6 +41,7 @@ def test_opencode_command_construction_and_inline_config() -> None:
     assert provider_cfg["options"]["apiKey"] == "{env:BID_REVIEW_OPENCODE_API_KEY}"
     assert provider_cfg["models"]["DeepSeek-V3.2"]["name"] == "DeepSeek-V3.2"
     assert env["BID_REVIEW_OPENCODE_API_KEY"] == "k-test"
+    assert "data" not in config
 
 
 def test_opencode_parse_invalid_json_output_fails(monkeypatch: pytest.MonkeyPatch) -> None:

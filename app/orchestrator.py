@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -11,6 +12,7 @@ from typing import Any, Callable
 from app.llm import create_llm_client
 from app.report import write_docx_report, write_json_report, write_markdown_report
 from app.report.to_json import write_raw_text
+from app.runtime_paths import REVIEW_PROFILE_ENV, default_output_root, managed_runtime_enabled
 from app.review import (
     detect_roles,
     detect_tender_and_bids,
@@ -25,6 +27,8 @@ class RunArtifacts:
     md_path: Path
     docx_path: Path
     raw_output_path: Path | None
+    metrics_path: Path | None
+    metrics: dict[str, Any]
     report: dict[str, Any]
     role_reasoning: str
     tender_path: str
@@ -41,7 +45,15 @@ class BatchArtifacts:
 
 
 def _resolve_output_dir(output_root: str | None) -> Path:
-    root = Path(output_root or "data/output")
+    raw_root = (output_root or "").strip()
+    if not raw_root:
+        root = default_output_root()
+    else:
+        candidate = Path(raw_root)
+        if managed_runtime_enabled() and not candidate.is_absolute() and raw_root.replace("\\", "/") == "data/output":
+            root = default_output_root()
+        else:
+            root = candidate
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     out = root / f"run-{stamp}"
     out.mkdir(parents=True, exist_ok=True)
@@ -79,6 +91,7 @@ def run_pipeline(
     model: str | None,
     opencode_model: str | None = None,
     effort: str,
+    review_profile: str = "thorough",
     show_progress: bool,
     progress_level: str,
     timeout_sec: int,
@@ -98,25 +111,38 @@ def run_pipeline(
 
     output_dir = _resolve_output_dir(output_root)
     resolved_workspace = workspace or str(Path.cwd())
-    selected_backend, client = create_llm_client(
-        backend=backend,
-        claude_bin=claude_bin,
-        opencode_bin=opencode_bin,
-        model=model,
-        opencode_model=opencode_model,
-        effort=effort,
-        show_progress=show_progress,
-        progress_level=progress_level,
-        timeout_sec=timeout_sec,
-        workspace=resolved_workspace,
-        mcp_config=mcp_config,
-        opencode_api_key=opencode_api_key,
-        opencode_api_url=opencode_api_url,
-        opencode_provider=opencode_provider,
-        progress_callback=progress_callback,
-    )
+    previous_review_profile = os.getenv(REVIEW_PROFILE_ENV)
+    os.environ[REVIEW_PROFILE_ENV] = review_profile
+    try:
+        selected_backend, client = create_llm_client(
+            backend=backend,
+            claude_bin=claude_bin,
+            opencode_bin=opencode_bin,
+            model=model,
+            opencode_model=opencode_model,
+            effort=effort,
+            show_progress=show_progress,
+            progress_level=progress_level,
+            timeout_sec=timeout_sec,
+            workspace=resolved_workspace,
+            mcp_config=mcp_config,
+            opencode_api_key=opencode_api_key,
+            opencode_api_url=opencode_api_url,
+            opencode_provider=opencode_provider,
+            progress_callback=progress_callback,
+        )
+    finally:
+        if previous_review_profile is None:
+            os.environ.pop(REVIEW_PROFILE_ENV, None)
+        else:
+            os.environ[REVIEW_PROFILE_ENV] = previous_review_profile
     if not client.available():
         if selected_backend == "claude":
+            unavailable_reason = getattr(client, "unavailable_reason", None)
+            if callable(unavailable_reason):
+                detail = unavailable_reason()
+                if detail:
+                    raise RuntimeError(detail)
             raise RuntimeError(
                 "未检测到可用的 Claude SDK 运行时。请先执行 `uv sync` 安装依赖，并配置 ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY。"
             )
@@ -186,10 +212,16 @@ def run_pipeline(
             client=client,
             extra_instruction=extra_instruction,
             user_instruction=user_instruction,
+            review_profile=review_profile,
         )
         json_path = write_json_report(report, run_subdir)
         md_path = write_markdown_report(report, run_subdir)
         docx_path = write_docx_report(report, run_subdir)
+        run_metrics = getattr(client, "_last_review_metrics", {}) or {}
+        metrics_path: Path | None = None
+        if isinstance(run_metrics, dict) and run_metrics:
+            metrics_path = run_subdir / "run_metrics.json"
+            metrics_path.write_text(json.dumps(run_metrics, ensure_ascii=False, indent=2), encoding="utf-8")
         raw_path: Path | None = None
         if save_raw_output:
             raw_path = write_raw_text(raw, run_subdir)
@@ -200,6 +232,8 @@ def run_pipeline(
                 md_path=md_path,
                 docx_path=docx_path,
                 raw_output_path=raw_path,
+                metrics_path=metrics_path,
+                metrics=run_metrics if isinstance(run_metrics, dict) else {},
                 report=report,
                 role_reasoning=role_reasoning,
                 tender_path=tender_abs,
@@ -223,6 +257,7 @@ def run_pipeline(
                 "markdown": str(r.md_path),
                 "docx": str(r.docx_path),
                 "claude_raw": str(r.raw_output_path) if r.raw_output_path else None,
+                "run_metrics": str(r.metrics_path) if r.metrics_path else None,
                 "summary": r.report.get("summary", {}),
             }
             for r in runs

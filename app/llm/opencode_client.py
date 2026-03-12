@@ -15,6 +15,14 @@ from typing import Any, Callable
 
 from app.llm.claude_client import ProgressLevel, extract_json_payload
 from app.llm.prompt_store import render_prompt
+from app.runtime_paths import (
+    OPENCODE_DATA_DIR_ENV,
+    RUNTIME_ROOT_ENV,
+    default_opencode_data_dir,
+    managed_runtime_enabled,
+    opencode_data_directory_enabled,
+    runtime_root,
+)
 
 
 class OpenCodeCallError(RuntimeError):
@@ -221,6 +229,9 @@ class OpenCodeClient:
 
     def _build_runtime_env(self) -> dict[str, str]:
         env = dict(os.environ)
+        managed_runtime = managed_runtime_enabled()
+        if managed_runtime:
+            env[RUNTIME_ROOT_ENV] = str(runtime_root())
         provider = (self.provider_id or "").strip()
         model = self._resolve_model()
         model_name = ""
@@ -235,6 +246,9 @@ class OpenCodeClient:
         mcp_section = self._build_mcp_section()
         need_inline_config = bool(self.api_key or self.api_url or mcp_section)
         if not need_inline_config:
+            data_dir = default_opencode_data_dir()
+            if managed_runtime and opencode_data_directory_enabled() and data_dir is not None:
+                env[OPENCODE_DATA_DIR_ENV] = str(data_dir)
             return env
 
         provider_cfg: dict[str, Any] = {
@@ -267,6 +281,14 @@ class OpenCodeClient:
                 mcp_config = {}
                 config_obj["mcp"] = mcp_config
             mcp_config.update(mcp_section)
+        data_dir = default_opencode_data_dir()
+        if managed_runtime and opencode_data_directory_enabled() and data_dir is not None:
+            data_section = config_obj.get("data")
+            if not isinstance(data_section, dict):
+                data_section = {}
+                config_obj["data"] = data_section
+            data_section["directory"] = str(data_dir)
+            env[OPENCODE_DATA_DIR_ENV] = str(data_dir)
         env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config_obj, ensure_ascii=False)
         return env
 

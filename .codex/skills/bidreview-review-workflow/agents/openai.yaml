@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bidreview Workflow"
+  short_description: "Route bidreview skill flow"
+  default_prompt: "Use $bidreview-review-workflow to choose the right bidreview skill."

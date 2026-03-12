@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from app.mcp_servers import paddle_ocr_server as server
 
 
@@ -29,6 +31,7 @@ def test_extract_clean_ocr_text_flattens_structured_payload_without_metadata() -
 
 
 def test_batch_ocr_images_prefers_client_source_path_and_sanitizes_text(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("BID_REVIEW_RUNTIME_ROOT", str(tmp_path / "runtime"))
     image_path = tmp_path / "page_0001.png"
     image_path.write_bytes(b"fake-image")
 
@@ -81,3 +84,55 @@ def test_batch_ocr_images_prefers_client_source_path_and_sanitizes_text(monkeypa
     assert result["summary"] == {"total_files": 1, "succeeded": 1, "failed": 0}
     assert result["results"][0]["source_path"] == str(image_path)
     assert result["results"][0]["text"] == "投标函\n投标人：示例科技有限公司"
+    assert result["metrics"]["cache_hit_count"] == 0
+    assert result["metrics"]["remote_batch_count"] == 1
+
+
+def test_batch_ocr_images_reuses_cache_on_second_run(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("BID_REVIEW_RUNTIME_ROOT", str(tmp_path / "runtime"))
+    image_path = tmp_path / "page_0001.png"
+    image_path.write_bytes(b"fake-image")
+
+    payload = {
+        "results": [
+            {
+                "source_path": str(image_path),
+                "success": True,
+                "text": "投标人：示例科技有限公司",
+                "elapsed_ms": 88,
+            }
+        ]
+    }
+
+    class _FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return payload
+
+    class _FakeClient:
+        post_calls = 0
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self) -> "_FakeClient":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        def post(self, url: str, *, data=None, files=None):
+            _FakeClient.post_calls += 1
+            return _FakeResponse()
+
+    monkeypatch.setattr(server.httpx, "Client", _FakeClient)
+
+    first = server._batch_ocr_images([image_path])
+    second = server._batch_ocr_images([image_path])
+
+    assert _FakeClient.post_calls == 1
+    assert first["metrics"]["cache_hit_count"] == 0
+    assert second["metrics"]["cache_hit_count"] == 1
+    assert second["results"][0]["cache_hit"] is True

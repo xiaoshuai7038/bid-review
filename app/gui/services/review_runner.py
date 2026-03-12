@@ -9,6 +9,7 @@ from PySide6.QtCore import QThread, Signal
 from app.gui.services.report_loader import BatchReviewData, load_batch_result
 from app.gui.state.settings import workspace_root
 from app.orchestrator import run_pipeline
+from app.runtime_paths import dir_is_writable, is_frozen, runtime_root_status
 
 
 @dataclass
@@ -27,6 +28,7 @@ class ReviewRunRequest:
     progress_level: str = "agent"
     timeout_sec: int = 1800
     effort: str = "low"
+    review_profile: str = "thorough"
     instruction: str = ""
     user_instruction: str = ""
     save_raw_output: bool = True
@@ -41,6 +43,12 @@ class ReviewRunRequest:
             raise ValueError("后端仅支持 claude 或 opencode。")
         if not self.output_dir:
             raise ValueError("请指定输出目录。")
+        output_path = Path(self.output_dir).expanduser().resolve()
+        parent = output_path if output_path.suffix == "" else output_path.parent
+        if is_frozen() and not dir_is_writable(parent):
+            raise ValueError(
+                f"结果保存位置不可写：{parent}。请将程序移动到可写目录，或手动选择其他保存位置。"
+            )
 
 
 def _append_if_value(args: list[str], flag: str, value: str) -> None:
@@ -56,6 +64,7 @@ def build_cli_arguments(request: ReviewRunRequest) -> list[str]:
     args.extend(["--progress-level", request.progress_level])
     args.extend(["--timeout-sec", str(request.timeout_sec)])
     args.extend(["--effort", request.effort])
+    args.extend(["--review-profile", request.review_profile])
     _append_if_value(args, "--model", request.model)
     _append_if_value(args, "--opencode-model", request.opencode_model)
     _append_if_value(args, "--instruction", request.instruction)
@@ -82,6 +91,12 @@ class ReviewWorker(QThread):
     def run(self) -> None:
         try:
             self.request.validate()
+            runtime_info = runtime_root_status()
+            if runtime_info.get("managed"):
+                self._emit_progress(
+                    f"[desktop] 当前运行目录根：{runtime_info.get('root')}（{'可写' if runtime_info.get('writable') else '不可写'}）",
+                    "basic",
+                )
             artifacts = run_pipeline(
                 inputs=[],
                 output_root=self.request.output_dir,
@@ -93,6 +108,7 @@ class ReviewWorker(QThread):
                 model=self.request.model or None,
                 opencode_model=self.request.opencode_model or None,
                 effort=self.request.effort,
+                review_profile=self.request.review_profile,
                 show_progress=True,
                 progress_level=self.request.progress_level,
                 timeout_sec=self.request.timeout_sec,

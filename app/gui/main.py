@@ -83,13 +83,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.smoke_test:
 
         def finish() -> None:
+            exit_code = 0
             if args.screenshot:
                 target = Path(args.screenshot).expanduser().resolve()
                 target.parent.mkdir(parents=True, exist_ok=True)
-                window.grab().save(str(target))
-            app.quit()
+                app.processEvents()
+                window.repaint()
+                app.processEvents()
+                saved = window.grab().save(str(target))
+                if not saved or not target.exists():
+                    exit_code = 1
+            app.exit(exit_code)
 
-        QTimer.singleShot(900, finish)
+        QTimer.singleShot(1500, finish)
 
     return app.exec()
 

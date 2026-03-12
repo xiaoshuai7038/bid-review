@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from PySide6.QtCore import QUrl
+from PySide6.QtWidgets import QSizePolicy
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -123,6 +124,11 @@ def test_review_page_form_controls_keep_usable_height(tmp_path: Path, monkeypatc
     assert page.instruction_edit.height() < 160
     assert page.user_instruction_edit.height() < 160
     assert page.left_scroll.widget() is not None
+    assert page.status_card.minimumHeight() == 176
+    assert page.status_card.maximumHeight() == 176
+    assert page.timeline_card.minimumHeight() >= 170
+    assert page.log_card.minimumHeight() >= 220
+    assert page.activity_splitter.count() == 2
 
     window.close()
     app.quit()
@@ -329,6 +335,86 @@ def test_review_page_instruction_editors_auto_grow_with_content(tmp_path: Path, 
     app.quit()
 
 
+def test_review_page_long_agent_message_stays_compact_in_status_panel(tmp_path: Path, monkeypatch) -> None:
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "default_backend": "claude",
+                "default_output_dir": str(tmp_path / "output"),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BID_REVIEW_GUI_SETTINGS_PATH", str(settings_path))
+
+    app = create_application([])
+    window = MainWindow()
+    window.resize(1560, 980)
+    window.show()
+    window._set_current_page(1)
+    app.processEvents()
+
+    page = window.review_page
+    long_message = (
+        "[agent] 当前阶段：提取硬性要求；下一步：继续核对投标文件中的模板字段、"
+        "开标一览表、分项报价表、投标保证金交纳证明、基本账户开户证明和偏离表，"
+        "并输出所有明确不符合项和需人工复核项。"
+    )
+    page.append_progress(long_message, "agent")
+    app.processEvents()
+
+    assert page.stage_value.height() <= 28
+    assert page.stage_note_value.height() <= 24
+    assert "下一步" in page.stage_note_value.text()
+    assert page.stage_note_value.toolTip()
+
+    window.close()
+    app.quit()
+
+
+def test_review_page_stage_result_list_is_collapsed_into_short_status_note(tmp_path: Path, monkeypatch) -> None:
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "default_backend": "claude",
+                "default_output_dir": str(tmp_path / "output"),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BID_REVIEW_GUI_SETTINGS_PATH", str(settings_path))
+
+    app = create_application([])
+    window = MainWindow()
+    window.resize(1560, 980)
+    window.show()
+    window._set_current_page(1)
+    app.processEvents()
+
+    page = window.review_page
+    long_stage_result = (
+        "[审查引擎] 阶段成果：我需要至少16条，已经超过16条。"
+        "现在开始按类别整理：1. 投标人资格；2. 营业执照；3. 项目负责人社保；"
+        "4. 行贿记录；5. 黑名单限制；6. 不接受分包；7. 不允许联合体；"
+        "8. 投标保证金；9. 财务要求；10. 业绩要求；11. 体系认证；"
+        "12. 签字盖章；13. 开标一览表；14. 分项报价表；15. 偏离表；16. 质保期。"
+    )
+    page.append_progress(long_stage_result, "agent")
+    app.processEvents()
+
+    assert page.stage_note_value.height() <= 24
+    assert page.stage_note_value.text() == "阶段成果已更新，详见下方详细记录。"
+    assert page.stage_note_value.toolTip()
+    assert "1. 投标人资格" in page.log_view.toPlainText()
+
+    window.close()
+    app.quit()
+
+
 def test_results_page_uses_user_friendly_labels(tmp_path: Path, monkeypatch) -> None:
     settings_path = tmp_path / "settings.json"
     settings_path.write_text(
@@ -407,6 +493,34 @@ def test_multi_file_drop_card_handles_windows_explorer_urls(tmp_path: Path) -> N
     app.quit()
 
 
+def test_single_file_drop_card_long_filename_does_not_expose_full_text_inline(tmp_path: Path) -> None:
+    long_name = (
+        "内蒙古昆明卷烟有限责任公司2025年度卷包机组新增扫码功能部署实施（ZQ）项目"
+        "2025年度卷包机组新增扫码功能部署实施（ZQ）项目.pdf"
+    )
+    file_path = tmp_path / long_name
+    file_path.write_text("demo", encoding="utf-8")
+
+    app = create_application([])
+    card = SingleFileDropCard("招标文件", "hint")
+    card.resize(360, 320)
+    card.show()
+    app.processEvents()
+
+    card.set_file(str(file_path))
+    app.processEvents()
+
+    assert card.hint_label.toolTip() == long_name
+    assert card.path_label.toolTip() == str(file_path.resolve())
+    assert card.hint_label.wordWrap() is True
+    assert card.path_label.wordWrap() is True
+    assert card.hint_label.sizePolicy().horizontalPolicy() == QSizePolicy.Ignored
+    assert card.path_label.sizePolicy().horizontalPolicy() == QSizePolicy.Ignored
+
+    card.close()
+    app.quit()
+
+
 def test_review_page_routes_viewport_drop_to_target_cards(tmp_path: Path, monkeypatch) -> None:
     settings_path = tmp_path / "settings.json"
     settings_path.write_text(
@@ -435,6 +549,95 @@ def test_review_page_routes_viewport_drop_to_target_cards(tmp_path: Path, monkey
 
     assert page._drop_target_for_viewport_pos(tender_point) is page.tender_card
     assert page._drop_target_for_viewport_pos(bid_point) is page.bid_card
+
+    window.close()
+    app.quit()
+
+
+def test_review_page_file_cards_stack_on_narrow_width_with_long_tender_name(tmp_path: Path, monkeypatch) -> None:
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "default_backend": "claude",
+                "default_output_dir": str(tmp_path / "output"),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BID_REVIEW_GUI_SETTINGS_PATH", str(settings_path))
+
+    tender_name = (
+        "内蒙古昆明卷烟有限责任公司2025年度卷包机组新增扫码功能部署实施（ZQ）项目"
+        "2025年度卷包机组新增扫码功能部署实施（ZQ）项目.pdf"
+    )
+    tender_file = tmp_path / tender_name
+    bid_file = tmp_path / "投标文件.docx"
+    tender_file.write_text("tender", encoding="utf-8")
+    bid_file.write_text("bid", encoding="utf-8")
+
+    app = create_application([])
+    window = MainWindow()
+    window.resize(1180, 900)
+    window.show()
+    window._set_current_page(1)
+    app.processEvents()
+
+    page = window.review_page
+    page.tender_card.set_file(str(tender_file))
+    page.bid_card.add_paths([str(bid_file)])
+    app.processEvents()
+
+    content = page.left_scroll.widget()
+    assert content is not None
+    assert page._file_cards_stacked is True
+    assert page.bid_card.geometry().top() > page.tender_card.geometry().bottom()
+    assert abs(page.bid_card.geometry().left() - page.tender_card.geometry().left()) <= 1
+    assert page.tender_card.geometry().right() <= content.rect().right()
+    assert page.bid_card.geometry().right() <= content.rect().right()
+
+    window.close()
+    app.quit()
+
+
+def test_review_page_file_cards_stay_two_column_on_wide_width_with_long_tender_name(tmp_path: Path, monkeypatch) -> None:
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "default_backend": "claude",
+                "default_output_dir": str(tmp_path / "output"),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BID_REVIEW_GUI_SETTINGS_PATH", str(settings_path))
+
+    tender_name = (
+        "内蒙古昆明卷烟有限责任公司2025年度卷包机组新增扫码功能部署实施（ZQ）项目"
+        "2025年度卷包机组新增扫码功能部署实施（ZQ）项目.pdf"
+    )
+    tender_file = tmp_path / tender_name
+    bid_file = tmp_path / "投标文件.docx"
+    tender_file.write_text("tender", encoding="utf-8")
+    bid_file.write_text("bid", encoding="utf-8")
+
+    app = create_application([])
+    window = MainWindow()
+    window.resize(1560, 980)
+    window.show()
+    window._set_current_page(1)
+    app.processEvents()
+
+    page = window.review_page
+    page.tender_card.set_file(str(tender_file))
+    page.bid_card.add_paths([str(bid_file)])
+    app.processEvents()
+
+    assert page._file_cards_stacked is False
+    assert page.bid_card.geometry().left() > page.tender_card.geometry().right()
 
     window.close()
     app.quit()

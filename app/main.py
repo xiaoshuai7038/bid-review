@@ -92,6 +92,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Claude 推理强度。",
     )
     parser.add_argument(
+        "--review-profile",
+        type=str,
+        default="thorough",
+        choices=["fast", "balanced", "thorough"],
+        help="审查执行策略：fast=速度优先，balanced=平衡，thorough=完整性优先。",
+    )
+    parser.add_argument(
         "--no-progress",
         action="store_true",
         help="关闭调用后端 CLI 时的实时进度输出。",
@@ -149,6 +156,7 @@ def main() -> int:
             model=args.model,
             opencode_model=args.opencode_model,
             effort=args.effort,
+            review_profile=args.review_profile,
             show_progress=not args.no_progress,
             progress_level=args.progress_level,
             timeout_sec=args.timeout_sec,

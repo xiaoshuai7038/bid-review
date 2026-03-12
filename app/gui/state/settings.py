@@ -4,42 +4,43 @@ from dataclasses import asdict, dataclass, field
 import json
 import os
 from pathlib import Path
-import sys
 from typing import Any
 
 from PySide6.QtCore import QStandardPaths
 
+from app.runtime_paths import (
+    default_output_root,
+    default_settings_path,
+    ensure_runtime_root_writable,
+    is_frozen,
+    runtime_root as shared_runtime_root,
+    runtime_root_status as shared_runtime_root_status,
+    workspace_root as shared_workspace_root,
+)
+
 
 def runtime_root() -> Path:
-    if getattr(sys, "frozen", False):
-        meipass = getattr(sys, "_MEIPASS", "")
-        if meipass:
-            return Path(meipass).resolve()
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parents[3]
+    return shared_runtime_root()
 
 
 def workspace_root() -> Path:
-    override = os.getenv("BID_REVIEW_GUI_WORKSPACE")
-    if override:
-        return Path(override).expanduser().resolve()
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return runtime_root()
+    return shared_workspace_root()
+
+
+def runtime_root_status() -> dict[str, str | bool]:
+    return shared_runtime_root_status()
 
 
 def _default_output_dir() -> str:
-    if getattr(sys, "frozen", False):
-        documents = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
-        base = Path(documents or Path.home() / "Documents") / "BidReview" / "output"
-        return str(base.resolve())
-    return str((workspace_root() / "data" / "output").resolve())
+    return str(default_output_root())
 
 
 def _settings_path() -> Path:
     override = os.getenv("BID_REVIEW_GUI_SETTINGS_PATH")
     if override:
         return Path(override).expanduser().resolve()
+    if is_frozen():
+        return default_settings_path()
     base = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
     root = Path(base) if base else Path.home() / ".bid-review-desktop"
     return root / "settings.json"
@@ -56,6 +57,7 @@ class DesktopSettings:
     default_progress_level: str = "agent"
     default_timeout_sec: int = 1800
     default_effort: str = "low"
+    default_review_profile: str = "thorough"
     default_instruction: str = ""
     default_user_instruction: str = ""
     claude_sdk_base_url: str = field(default_factory=lambda: os.getenv("ANTHROPIC_BASE_URL", ""))
@@ -99,6 +101,8 @@ class SettingsStore:
         return DesktopSettings.from_dict(raw)
 
     def save(self, settings: DesktopSettings) -> None:
+        if is_frozen():
+            ensure_runtime_root_writable()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(asdict(settings), ensure_ascii=False, indent=2), encoding="utf-8")
 

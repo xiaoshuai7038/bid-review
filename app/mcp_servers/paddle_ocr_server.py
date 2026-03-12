@@ -5,6 +5,8 @@ import os
 import re
 import shutil
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -12,6 +14,9 @@ from typing import Any
 import httpx
 import fitz
 from mcp.server.fastmcp import FastMCP
+from app.review.execution_policy import ReviewExecutionPolicy, normalize_review_profile
+from app.review.prepared_artifacts import file_sha256, ocr_cache_file
+from app.runtime_paths import default_ocr_temp_root, ensure_dir
 
 DEFAULT_OCR_BACKEND_URL = "https://u372299-h9rw-37d89577.westd.seetacloud.com:8443"
 IMAGE_EXTENSIONS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
@@ -32,6 +37,7 @@ class OCRFileResult:
     text: str | None
     error: str | None = None
     elapsed_ms: int | None = None
+    cache_hit: bool = False
 
 
 def _env_str(name: str, default: str) -> str:
@@ -47,11 +53,14 @@ def _api_key() -> str:
 
 
 def _chunk_size() -> int:
-    raw = _env_str("OCRMCP_CHUNK_SIZE", "16").strip()
-    try:
-        return max(1, int(raw))
-    except Exception:
-        return 16
+    raw = os.getenv("OCRMCP_CHUNK_SIZE", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except Exception:
+            pass
+    profile = normalize_review_profile(os.getenv("BID_REVIEW_REVIEW_PROFILE", "thorough"))
+    return ReviewExecutionPolicy.for_profile(profile).ocr_concurrency.chunk_size
 
 
 def _timeout_seconds() -> int:
@@ -62,6 +71,17 @@ def _timeout_seconds() -> int:
         return 600
 
 
+def _max_inflight_chunks() -> int:
+    raw = _env_str("OCRMCP_MAX_INFLIGHT_CHUNKS", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except Exception:
+            pass
+    profile = normalize_review_profile(os.getenv("BID_REVIEW_REVIEW_PROFILE", "thorough"))
+    return ReviewExecutionPolicy.for_profile(profile).ocr_concurrency.max_inflight_chunks
+
+
 def _headers() -> dict[str, str]:
     headers: dict[str, str] = {}
     api_key = _api_key().strip()
@@ -70,8 +90,78 @@ def _headers() -> dict[str, str]:
     return headers
 
 
+def _cache_enabled() -> bool:
+    return _env_str("OCRMCP_CACHE_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _chunked(items: list[Path], size: int) -> list[list[Path]]:
     return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+def _cache_entry_for_path(path: Path, *, language: str) -> tuple[str, Path]:
+    image_hash = file_sha256(path)
+    cache_path = ocr_cache_file(image_hash, language=language, backend_url=_backend_url())
+    return image_hash, cache_path
+
+
+def _load_cached_result(path: Path, *, language: str) -> OCRFileResult | None:
+    if not _cache_enabled():
+        return None
+    _, cache_path = _cache_entry_for_path(path, language=language)
+    if not cache_path.exists():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    text = str(payload.get("ocr_text") or "").strip()
+    if not text:
+        return None
+    return OCRFileResult(
+        source_path=str(path),
+        success=True,
+        text=text,
+        error=None,
+        elapsed_ms=int(payload.get("elapsed_ms", 0) or 0),
+        cache_hit=True,
+    )
+
+
+def _store_cached_result(path: Path, *, language: str, text: str, elapsed_ms: int | None) -> None:
+    if not _cache_enabled():
+        return
+    _, cache_path = _cache_entry_for_path(path, language=language)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps(
+            {
+                "source_path": str(path),
+                "ocr_text": text,
+                "elapsed_ms": elapsed_ms,
+                "language": language,
+                "backend_url": _backend_url(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _managed_ocr_temp_dir(prefix: str) -> tempfile.TemporaryDirectory[str]:
+    managed_root = default_ocr_temp_root()
+    if managed_root is not None:
+        parent = ensure_dir(managed_root)
+        return tempfile.TemporaryDirectory(prefix=prefix, dir=str(parent))
+    return tempfile.TemporaryDirectory(prefix=prefix)
+
+
+def _managed_ocr_mkdtemp(prefix: str) -> Path:
+    managed_root = default_ocr_temp_root()
+    if managed_root is not None:
+        parent = ensure_dir(managed_root)
+        return Path(tempfile.mkdtemp(prefix=prefix, dir=str(parent))).resolve()
+    return Path(tempfile.mkdtemp(prefix=prefix)).resolve()
 
 
 def _expand_local_images(inputs: list[str], recursive: bool = False) -> list[Path]:
@@ -113,6 +203,80 @@ def _preview_results(results: list[OCRFileResult], limit: int = 5) -> list[dict[
             payload["text"] = text[:240] + "..."
         preview.append(payload)
     return preview
+
+
+def _ocr_chunk_via_backend(chunk: list[Path], *, language: str) -> list[OCRFileResult]:
+    started = time.perf_counter()
+    try:
+        temp_dir_ctx = _managed_ocr_temp_dir(prefix="ocr_upload_")
+    except Exception as exc:  # noqa: BLE001
+        return [
+            OCRFileResult(
+                source_path=str(path),
+                success=False,
+                text=None,
+                error=f"创建 OCR 临时目录失败: {exc}",
+            )
+            for path in chunk
+        ]
+    with temp_dir_ctx as _tmp_dir:
+        files = []
+        handles = []
+        try:
+            for path in chunk:
+                handle = path.open("rb")
+                handles.append(handle)
+                files.append(("files", (path.name, handle, "application/octet-stream")))
+            data = {"client_paths_json": json.dumps([str(path) for path in chunk], ensure_ascii=False)}
+            with httpx.Client(timeout=_timeout_seconds(), headers=_headers(), verify=False) as client:
+                response = client.post(f"{_backend_url().rstrip('/')}/v1/ocr/images", data=data, files=files)
+                response.raise_for_status()
+                payload = response.json()
+        except Exception as exc:  # noqa: BLE001
+            return [
+                OCRFileResult(
+                    source_path=str(path),
+                    success=False,
+                    text=None,
+                    error=str(exc),
+                )
+                for path in chunk
+            ]
+        finally:
+            for handle in handles:
+                handle.close()
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    out: list[OCRFileResult] = []
+    for index, item in enumerate(payload.get("results", [])):
+        client_path = chunk[index] if index < len(chunk) else None
+        resolved_path = _resolve_result_source_path(item, client_path)
+        text = _extract_clean_ocr_text(item.get("text"))
+        result = OCRFileResult(
+            source_path=resolved_path or str(client_path) if client_path else "",
+            success=bool(item.get("success")),
+            text=text,
+            error=item.get("error"),
+            elapsed_ms=item.get("elapsed_ms") or elapsed_ms,
+            cache_hit=False,
+        )
+        if result.success and result.text and client_path is not None:
+            _store_cached_result(client_path, language=language, text=result.text, elapsed_ms=result.elapsed_ms)
+        out.append(result)
+    if len(out) < len(chunk):
+        seen_paths = {item.source_path for item in out}
+        for path in chunk:
+            if str(path) in seen_paths:
+                continue
+            out.append(
+                OCRFileResult(
+                    source_path=str(path),
+                    success=False,
+                    text=None,
+                    error="OCR 后端返回结果数量不足",
+                    elapsed_ms=elapsed_ms,
+                )
+            )
+    return out
 
 
 def _sanitize_ocr_text_line(line: str) -> str:
@@ -195,47 +359,59 @@ def _resolve_result_source_path(result_item: dict[str, Any], client_path: Path |
     return backend_source
 
 
-def _batch_ocr_images(paths: list[Path], *, chunk_size: int | None = None) -> dict[str, Any]:
+def _batch_ocr_images(paths: list[Path], *, chunk_size: int | None = None, language: str = "ch") -> dict[str, Any]:
     if not paths:
-        return {"summary": {"total_files": 0, "succeeded": 0, "failed": 0}, "results": []}
+        return {"summary": {"total_files": 0, "succeeded": 0, "failed": 0}, "results": [], "metrics": {}}
 
     all_results: list[OCRFileResult] = []
     effective_chunk_size = chunk_size or _chunk_size()
+    cached_results: dict[str, OCRFileResult] = {}
+    uncached_paths: list[Path] = []
+    for path in paths:
+        cached = _load_cached_result(path, language=language)
+        if cached is not None:
+            cached_results[str(path)] = cached
+        else:
+            uncached_paths.append(path)
 
-    with httpx.Client(timeout=_timeout_seconds(), headers=_headers(), verify=False) as client:
-        for chunk in _chunked(paths, effective_chunk_size):
-            with tempfile.TemporaryDirectory(prefix="ocr_upload_") as _tmp_dir:
-                files = []
-                handles = []
-                try:
-                    for path in chunk:
-                        handle = path.open("rb")
-                        handles.append(handle)
-                        files.append(("files", (path.name, handle, "application/octet-stream")))
-                    data = {"client_paths_json": json.dumps([str(path) for path in chunk], ensure_ascii=False)}
-                    response = client.post(f"{_backend_url().rstrip('/')}/v1/ocr/images", data=data, files=files)
-                    response.raise_for_status()
-                    payload = response.json()
-                finally:
-                    for handle in handles:
-                        handle.close()
+    remote_batches = _chunked(uncached_paths, effective_chunk_size)
+    remote_results_by_path: dict[str, OCRFileResult] = {}
+    if remote_batches:
+        max_workers = min(max(1, _max_inflight_chunks()), len(remote_batches))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(_ocr_chunk_via_backend, chunk, language=language): chunk
+                for chunk in remote_batches
+            }
+            for future in as_completed(future_map):
+                chunk_results = future.result()
+                for result in chunk_results:
+                    remote_results_by_path[result.source_path] = result
 
-            for index, item in enumerate(payload.get("results", [])):
-                client_path = chunk[index] if index < len(chunk) else None
-                all_results.append(
-                    OCRFileResult(
-                        source_path=_resolve_result_source_path(item, client_path),
-                        success=bool(item.get("success")),
-                        text=_extract_clean_ocr_text(item.get("text")),
-                        error=item.get("error"),
-                        elapsed_ms=item.get("elapsed_ms"),
-                    )
-                )
+    for path in paths:
+        key = str(path)
+        result = cached_results.get(key) or remote_results_by_path.get(key)
+        if result is None:
+            result = OCRFileResult(
+                source_path=key,
+                success=False,
+                text=None,
+                error="OCR 结果缺失",
+            )
+        all_results.append(result)
 
     return {
         "summary": _summarize_results(all_results),
         "preview": _preview_results(all_results),
         "results": [asdict(item) for item in all_results],
+        "metrics": {
+            "total_files": len(paths),
+            "cache_hit_count": sum(1 for item in all_results if item.cache_hit),
+            "remote_batch_count": len(remote_batches),
+            "remote_request_file_count": len(uncached_paths),
+            "chunk_size": effective_chunk_size,
+            "max_inflight_chunks": _max_inflight_chunks(),
+        },
     }
 
 
@@ -265,13 +441,14 @@ def _ocr_images_in_directory(dir_path: str, language: str = "ch") -> str:
             ensure_ascii=False,
             indent=2,
         )
-    payload = _batch_ocr_images([Path(path) for path in image_paths])
+    payload = _batch_ocr_images([Path(path) for path in image_paths], language=language)
     return json.dumps(
         {
             "image_count": len(image_paths),
             "processed_count": len(payload.get("results", [])),
             "results": payload.get("results", []),
             "summary": payload.get("summary", {}),
+            "metrics": payload.get("metrics", {}),
         },
         ensure_ascii=False,
         indent=2,
@@ -284,7 +461,7 @@ def _ocr_image_file(file_path: str, language: str = "ch") -> str:
         return f"错误：文件不存在 - {path}"
     if path.suffix.lower() not in IMAGE_EXTENSIONS:
         return f"错误：不支持的图像格式 {path.suffix}"
-    payload = _batch_ocr_images([path])
+    payload = _batch_ocr_images([path], language=language)
     return _ocr_text_from_single_result(payload)
 
 
@@ -311,12 +488,15 @@ def _ocr_pdf_file(file_path: str, language: str = "ch") -> str:
     if path.suffix.lower() != ".pdf":
         return "错误：文件不是 PDF 格式"
 
-    temp_dir = Path(tempfile.mkdtemp(prefix="ocr_pdf_pages_"))
+    try:
+        temp_dir = _managed_ocr_mkdtemp(prefix="ocr_pdf_pages_")
+    except Exception as exc:  # noqa: BLE001
+        return f"OCR处理PDF时出错：创建临时目录失败：{exc}"
     try:
         image_paths = _render_pdf_to_images(str(path), temp_dir)
         if not image_paths:
             return "错误：PDF 未生成可识别页面"
-        payload = _batch_ocr_images(image_paths)
+        payload = _batch_ocr_images(image_paths, language=language)
         lines: list[str] = []
         for index, item in enumerate(payload.get("results", []), start=1):
             text = _extract_clean_ocr_text(item.get("text"))

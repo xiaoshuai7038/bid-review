@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
+import re
 
 from PySide6.QtCore import QDateTime, QEvent, QPoint, Qt, Signal, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPixmap
@@ -42,7 +43,7 @@ from app.gui.services import (
     find_latest_batch_summary,
     load_batch_result,
 )
-from app.gui.state import DesktopSettings, SettingsStore, runtime_root
+from app.gui.state import DesktopSettings, SettingsStore, runtime_root, runtime_root_status
 
 
 def _open_local_path(path: str | Path | None) -> bool:
@@ -86,7 +87,14 @@ EFFORT_ITEMS: list[tuple[str, str]] = [
     ("仔细", "high"),
 ]
 
+REVIEW_PROFILE_ITEMS: list[tuple[str, str]] = [
+    ("速度优先", "fast"),
+    ("平衡", "balanced"),
+    ("完整性优先", "thorough"),
+]
+
 APP_DISPLAY_NAME = "标书审查工作台"
+FILE_CARDS_STACK_THRESHOLD = 620
 
 BACKEND_ITEMS: list[tuple[str, str]] = [
     ("Claude 引擎", "claude"),
@@ -97,6 +105,12 @@ BACKEND_ITEMS: list[tuple[str, str]] = [
 def _pin_form_field_height(widget: QWidget, min_height: int = 40) -> None:
     widget.setMinimumHeight(min_height)
     widget.setSizePolicy(widget.sizePolicy().horizontalPolicy(), QSizePolicy.Fixed)
+
+
+def _allow_label_to_shrink(label: QLabel, *, word_wrap: bool) -> None:
+    label.setWordWrap(word_wrap)
+    label.setMinimumWidth(0)
+    label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
 
 def _configure_form_layout(form: QFormLayout) -> None:
@@ -123,6 +137,12 @@ def _populate_backend_combo(combo: QComboBox) -> None:
 def _populate_effort_combo(combo: QComboBox) -> None:
     combo.clear()
     for label, value in EFFORT_ITEMS:
+        combo.addItem(label, value)
+
+
+def _populate_review_profile_combo(combo: QComboBox) -> None:
+    combo.clear()
+    for label, value in REVIEW_PROFILE_ITEMS:
         combo.addItem(label, value)
 
 
@@ -172,6 +192,35 @@ def _friendly_progress_message(message: str) -> str:
     for raw, friendly in replacements.items():
         display = display.replace(raw, friendly)
     return display
+
+
+def _collapse_progress_text(message: str, *, limit: int = 120) -> str:
+    text = re.sub(r"\s+", " ", str(message or "")).strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "..."
+
+
+def _compact_status_detail(
+    text: str,
+    *,
+    limit: int = 88,
+    fallback: str = "详情见下方详细记录。",
+) -> str:
+    raw = str(text or "").strip()
+    normalized = re.sub(r"\s+", " ", raw).strip()
+    if not normalized:
+        return fallback
+    looks_like_list = (
+        "\n" in raw
+        or re.search(r"(?:^|\s)(?:\d+[\.、]|[-*•])", raw) is not None
+        or normalized.count("；") >= 2
+    )
+    if looks_like_list and len(normalized) > 40:
+        return fallback
+    if len(normalized) <= limit:
+        return normalized
+    return f"{_collapse_progress_text(normalized, limit=limit - 10)} 详见下方详细记录。"
 
 
 def _extract_local_file_paths_from_urls(urls: list[QUrl]) -> list[str]:
@@ -280,8 +329,9 @@ class SingleFileDropCard(SurfaceFrame):
         title_label.setObjectName("SectionTitle")
         self.hint_label = QLabel(hint)
         self.hint_label.setObjectName("MutedLabel")
+        _allow_label_to_shrink(self.hint_label, word_wrap=True)
         self.path_label = QLabel("拖入文件或点击选择")
-        self.path_label.setWordWrap(True)
+        _allow_label_to_shrink(self.path_label, word_wrap=True)
 
         action_row = QHBoxLayout()
         self.browse_button = QPushButton("选择文件")
@@ -348,12 +398,17 @@ class SingleFileDropCard(SurfaceFrame):
     def set_file(self, path: str) -> None:
         self._path = str(Path(path).expanduser().resolve())
         self.path_label.setText(self._path)
-        self.hint_label.setText(_basename(self._path))
+        self.path_label.setToolTip(self._path)
+        basename = _basename(self._path)
+        self.hint_label.setText(basename)
+        self.hint_label.setToolTip(basename)
 
     def clear(self) -> None:
         self._path = ""
         self.path_label.setText("拖入文件或点击选择")
+        self.path_label.setToolTip("")
         self.hint_label.setText(self._hint)
+        self.hint_label.setToolTip("")
 
     def file_path(self) -> str:
         return self._path
@@ -372,6 +427,7 @@ class MultiFileDropCard(SurfaceFrame):
         title_label.setObjectName("SectionTitle")
         self.count_label = QLabel(hint)
         self.count_label.setObjectName("MutedLabel")
+        _allow_label_to_shrink(self.count_label, word_wrap=True)
         self.list_widget = QListWidget()
         self.list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
 
@@ -619,12 +675,15 @@ class ReviewPage(QWidget):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(18)
 
-        file_row = QHBoxLayout()
-        file_row.setSpacing(18)
         self.tender_card = SingleFileDropCard("招标文件", "仅需 1 份，用于提取招标要求和评审基线")
         self.bid_card = MultiFileDropCard("投标文件", "支持同时审查 1 份或多份投标文件")
-        file_row.addWidget(self.tender_card, 1)
-        file_row.addWidget(self.bid_card, 1)
+        self.file_cards = QWidget()
+        self.file_cards_layout = QGridLayout(self.file_cards)
+        self.file_cards_layout.setContentsMargins(0, 0, 0, 0)
+        self.file_cards_layout.setHorizontalSpacing(18)
+        self.file_cards_layout.setVerticalSpacing(18)
+        self._file_cards_stacked = False
+        self._set_file_cards_stacked(False, force=True)
 
         config_card = SurfaceFrame("card")
         config_layout = QVBoxLayout(config_card)
@@ -646,6 +705,8 @@ class ReviewPage(QWidget):
         self.timeout_spin.setSingleStep(60)
         self.effort_combo = QComboBox()
         _populate_effort_combo(self.effort_combo)
+        self.review_profile_combo = QComboBox()
+        _populate_review_profile_combo(self.review_profile_combo)
         self.save_raw_checkbox = QCheckBox("保留原始运行记录（便于排查问题）")
         self.save_raw_checkbox.setChecked(True)
 
@@ -658,6 +719,7 @@ class ReviewPage(QWidget):
         _pin_form_field_height(self.output_dir_edit)
         _pin_form_field_height(self.timeout_spin)
         _pin_form_field_height(self.effort_combo)
+        _pin_form_field_height(self.review_profile_combo)
         self.output_dir_button.setMinimumHeight(40)
         self.output_dir_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
@@ -677,6 +739,7 @@ class ReviewPage(QWidget):
         form.addRow("结果保存位置", output_wrap)
         form.addRow("超时时间（秒）", self.timeout_spin)
         form.addRow("审查仔细程度", self.effort_combo)
+        form.addRow("审查策略", self.review_profile_combo)
 
         config_layout.addWidget(config_title)
         config_layout.addLayout(form)
@@ -707,7 +770,7 @@ class ReviewPage(QWidget):
         bottom_hint.setObjectName("MutedLabel")
         action_layout.addWidget(bottom_hint)
 
-        left_layout.addLayout(file_row)
+        left_layout.addWidget(self.file_cards)
         left_layout.addWidget(config_card)
         left_layout.addWidget(instruction_card)
         left_layout.addWidget(action_card)
@@ -728,39 +791,56 @@ class ReviewPage(QWidget):
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(18)
 
-        status_card = SurfaceFrame("card")
-        status_layout = QGridLayout(status_card)
+        self.status_card = SurfaceFrame("card")
+        self.status_card.setFixedHeight(176)
+        status_layout = QGridLayout(self.status_card)
         status_layout.setContentsMargins(24, 20, 24, 20)
         status_layout.setHorizontalSpacing(18)
-        status_layout.setVerticalSpacing(10)
+        status_layout.setVerticalSpacing(6)
         status_title = QLabel("执行状态")
         status_title.setObjectName("SectionTitle")
         self.stage_value = QLabel("等待开始")
+        self.stage_note_value = QLabel("等待第一条进度消息")
         self.current_bid_value = QLabel("未开始")
         self.result_value = QLabel("就绪")
-        self.stage_value.setWordWrap(True)
-        self.current_bid_value.setWordWrap(True)
-        self.result_value.setWordWrap(True)
+        self.stage_value.setWordWrap(False)
+        self.stage_note_value.setObjectName("MutedLabel")
+        self.stage_note_value.setWordWrap(False)
+        self.current_bid_value.setWordWrap(False)
+        self.result_value.setWordWrap(False)
+        self.stage_value.setMaximumHeight(28)
+        self.stage_note_value.setMaximumHeight(24)
+        self.current_bid_value.setMaximumHeight(24)
+        self.result_value.setMaximumHeight(28)
+        self.stage_value.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.stage_note_value.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.current_bid_value.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.result_value.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         status_layout.addWidget(status_title, 0, 0, 1, 2)
         status_layout.addWidget(QLabel("当前阶段"), 1, 0)
         status_layout.addWidget(self.stage_value, 1, 1)
-        status_layout.addWidget(QLabel("当前投标文件"), 2, 0)
-        status_layout.addWidget(self.current_bid_value, 2, 1)
-        status_layout.addWidget(QLabel("任务状态"), 3, 0)
-        status_layout.addWidget(self.result_value, 3, 1)
+        status_layout.addWidget(QLabel("阶段说明"), 2, 0)
+        status_layout.addWidget(self.stage_note_value, 2, 1)
+        status_layout.addWidget(QLabel("当前投标文件"), 3, 0)
+        status_layout.addWidget(self.current_bid_value, 3, 1)
+        status_layout.addWidget(QLabel("任务状态"), 4, 0)
+        status_layout.addWidget(self.result_value, 4, 1)
 
-        timeline_card = SurfaceFrame("card")
-        timeline_layout = QVBoxLayout(timeline_card)
+        self.timeline_card = SurfaceFrame("card")
+        self.timeline_card.setMinimumHeight(170)
+        timeline_layout = QVBoxLayout(self.timeline_card)
         timeline_layout.setContentsMargins(24, 20, 24, 20)
         timeline_layout.setSpacing(12)
         timeline_title = QLabel("处理进度")
         timeline_title.setObjectName("SectionTitle")
         self.timeline_list = QListWidget()
+        self.timeline_list.setUniformItemSizes(True)
         timeline_layout.addWidget(timeline_title)
         timeline_layout.addWidget(self.timeline_list, 1)
 
-        log_card = SurfaceFrame("card")
-        log_layout = QVBoxLayout(log_card)
+        self.log_card = SurfaceFrame("card")
+        self.log_card.setMinimumHeight(220)
+        log_layout = QVBoxLayout(self.log_card)
         log_layout.setContentsMargins(24, 20, 24, 20)
         log_layout.setSpacing(12)
         log_title = QLabel("详细记录")
@@ -771,9 +851,16 @@ class ReviewPage(QWidget):
         log_layout.addWidget(log_title)
         log_layout.addWidget(self.log_view, 1)
 
-        right_layout.addWidget(status_card)
-        right_layout.addWidget(timeline_card, 1)
-        right_layout.addWidget(log_card, 2)
+        self.activity_splitter = QSplitter(Qt.Vertical)
+        self.activity_splitter.setChildrenCollapsible(False)
+        self.activity_splitter.addWidget(self.timeline_card)
+        self.activity_splitter.addWidget(self.log_card)
+        self.activity_splitter.setStretchFactor(0, 1)
+        self.activity_splitter.setStretchFactor(1, 2)
+        self.activity_splitter.setSizes([240, 360])
+
+        right_layout.addWidget(self.status_card, 0)
+        right_layout.addWidget(self.activity_splitter, 1)
 
         splitter.addWidget(left_container)
         splitter.addWidget(right)
@@ -790,6 +877,8 @@ class ReviewPage(QWidget):
     def eventFilter(self, watched: object, event: object) -> bool:
         if watched is self.left_scroll.viewport() and hasattr(event, "type"):
             event_type = event.type()
+            if event_type == QEvent.Resize:
+                self._update_file_cards_layout()
             if event_type in {QEvent.DragEnter, QEvent.DragMove} and hasattr(event, "mimeData"):
                 point = self._event_point(event)
                 if point is not None and self._drop_target_for_viewport_pos(point) is not None:
@@ -831,6 +920,38 @@ class ReviewPage(QWidget):
             return event.pos()
         return None
 
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._update_file_cards_layout()
+
+    def _available_file_cards_width(self) -> int:
+        viewport = self.left_scroll.viewport()
+        if viewport is not None:
+            return max(0, viewport.width())
+        return max(0, self.width())
+
+    def _update_file_cards_layout(self) -> None:
+        self._set_file_cards_stacked(self._available_file_cards_width() < FILE_CARDS_STACK_THRESHOLD)
+
+    def _set_file_cards_stacked(self, stacked: bool, *, force: bool = False) -> None:
+        if not force and stacked == self._file_cards_stacked:
+            return
+        self.file_cards_layout.removeWidget(self.tender_card)
+        self.file_cards_layout.removeWidget(self.bid_card)
+        self.file_cards_layout.setColumnStretch(0, 0)
+        self.file_cards_layout.setColumnStretch(1, 0)
+        self.file_cards_layout.setRowStretch(0, 0)
+        self.file_cards_layout.setRowStretch(1, 0)
+        self.file_cards_layout.addWidget(self.tender_card, 0, 0)
+        if stacked:
+            self.file_cards_layout.addWidget(self.bid_card, 1, 0)
+            self.file_cards_layout.setColumnStretch(0, 1)
+        else:
+            self.file_cards_layout.addWidget(self.bid_card, 0, 1)
+            self.file_cards_layout.setColumnStretch(0, 1)
+            self.file_cards_layout.setColumnStretch(1, 1)
+        self._file_cards_stacked = stacked
+
     def load_settings(self, settings: DesktopSettings) -> None:
         self._backend_model_defaults = {
             "claude": settings.model_for_backend("claude"),
@@ -847,6 +968,7 @@ class ReviewPage(QWidget):
         self.output_dir_edit.setText(settings.default_output_dir)
         self.timeout_spin.setValue(settings.default_timeout_sec or 1800)
         _set_combo_value(self.effort_combo, settings.default_effort or "low")
+        _set_combo_value(self.review_profile_combo, settings.default_review_profile or "thorough")
         self.instruction_edit.setPlainText(settings.default_instruction)
         self.user_instruction_edit.setPlainText(settings.default_user_instruction)
 
@@ -865,6 +987,7 @@ class ReviewPage(QWidget):
             progress_level=_combo_value(self.progress_combo),
             timeout_sec=self.timeout_spin.value(),
             effort=_combo_value(self.effort_combo),
+            review_profile=_combo_value(self.review_profile_combo),
             instruction=self.instruction_edit.toPlainText().strip(),
             user_instruction=self.user_instruction_edit.toPlainText().strip(),
             save_raw_output=self.save_raw_checkbox.isChecked(),
@@ -873,9 +996,10 @@ class ReviewPage(QWidget):
     def clear_progress(self) -> None:
         self.log_view.clear()
         self.timeline_list.clear()
-        self.stage_value.setText("等待开始")
-        self.current_bid_value.setText("未开始")
-        self.result_value.setText("就绪")
+        self._set_stage_text("等待开始")
+        self._set_stage_note("等待第一条进度消息")
+        self._set_current_bid_text("未开始")
+        self._set_result_text("就绪")
 
     def append_progress(self, message: str, level: str) -> None:
         timestamp = QDateTime.currentDateTime().toString("HH:mm:ss")
@@ -884,28 +1008,88 @@ class ReviewPage(QWidget):
         if message.startswith("[pipeline]") or message.startswith("[agent]") or level in {"basic", "agent"}:
             self.timeline_list.addItem(f"{timestamp}  {display_message}")
             self.timeline_list.scrollToBottom()
-        self._update_status(message)
+        self._update_status(display_message)
 
     def set_running(self, running: bool) -> None:
         self.run_button.setEnabled(not running)
         self.run_button.setText("审查进行中..." if running else "开始审查")
-        self.result_value.setText("运行中" if running else self.result_value.text())
+        if running:
+            self._set_result_text("运行中")
+
+    def _set_stage_text(self, text: str, *, tooltip: str | None = None) -> None:
+        display = _collapse_progress_text(text, limit=56)
+        self.stage_value.setText(display)
+        self.stage_value.setToolTip(tooltip or text)
+
+    def _set_stage_note(self, text: str, *, tooltip: str | None = None) -> None:
+        display = _collapse_progress_text(text, limit=80)
+        self.stage_note_value.setText(display)
+        self.stage_note_value.setToolTip(tooltip or text)
+
+    def _set_current_bid_text(self, text: str, *, tooltip: str | None = None) -> None:
+        display = _collapse_progress_text(text, limit=72)
+        self.current_bid_value.setText(display)
+        self.current_bid_value.setToolTip(tooltip or text)
+
+    def _set_result_text(self, text: str, *, tooltip: str | None = None) -> None:
+        display = _collapse_progress_text(text, limit=32)
+        self.result_value.setText(display)
+        self.result_value.setToolTip(tooltip or text)
 
     def _update_status(self, message: str) -> None:
-        if "自动识别招标/投标文件角色" in message:
-            self.stage_value.setText("正在识别文件类型")
-        elif "角色识别完成" in message:
-            self.stage_value.setText("文件识别完成")
-        elif "开始审查" in message:
-            self.stage_value.setText("正在逐份审查")
-            self.current_bid_value.setText(message.split(":", 1)[-1].strip())
-            self.result_value.setText("运行中")
-        elif "完成审查" in message:
-            self.stage_value.setText("本轮报告已生成")
-        elif "会话已建立" in message:
-            self.stage_value.setText("审查引擎已就绪")
-        elif message.startswith("[agent]"):
-            self.stage_value.setText(message.replace("[agent]", "", 1).strip())
+        raw = (message or "").strip()
+        if "自动识别招标/投标文件角色" in raw:
+            self._set_stage_text("正在识别文件类型")
+            self._set_stage_note("准备确认招标文件和投标文件角色。")
+            return
+        if "角色识别完成" in raw:
+            self._set_stage_text("文件识别完成")
+            self._set_stage_note("已确认本次任务的招标文件和投标文件。")
+            return
+        if "开始审查" in raw:
+            self._set_stage_text("正在逐份审查")
+            self._set_stage_note("已进入逐份审查阶段。")
+            self._set_current_bid_text(raw.split(":", 1)[-1].strip())
+            self._set_result_text("运行中")
+            return
+        if "完成审查" in raw:
+            self._set_stage_text("本轮报告已生成")
+            self._set_stage_note("当前投标文件的报告已写入输出目录。")
+            return
+        if "会话已建立" in raw:
+            self._set_stage_text("审查引擎已就绪")
+            self._set_stage_note(raw)
+            return
+        if raw.startswith("[审查引擎] 当前阶段："):
+            body = raw.replace("[审查引擎] 当前阶段：", "", 1).strip()
+            phase, sep, next_hint = body.partition("；下一步：")
+            self._set_stage_text(phase.strip() or "正在审查", tooltip=body)
+            if sep and next_hint.strip():
+                self._set_stage_note(f"下一步：{next_hint.strip()}", tooltip=body)
+            else:
+                self._set_stage_note("继续推进当前审查阶段。", tooltip=body)
+            return
+        if raw.startswith("[审查引擎] 进行中："):
+            body = raw.replace("[审查引擎] 进行中：", "", 1).strip()
+            self._set_stage_note(
+                _compact_status_detail(body, fallback="正在处理细节步骤，详见下方详细记录。"),
+                tooltip=body,
+            )
+            return
+        if raw.startswith("[审查引擎] 阶段成果："):
+            body = raw.replace("[审查引擎] 阶段成果：", "", 1).strip()
+            self._set_stage_note(
+                _compact_status_detail(body, fallback="阶段成果已更新，详见下方详细记录。"),
+                tooltip=body,
+            )
+            return
+        if raw.startswith("[审查引擎] 输出摘要："):
+            body = raw.replace("[审查引擎] 输出摘要：", "", 1).strip()
+            summary = _compact_status_detail(body, fallback="输出摘要较长，详见下方详细记录。")
+            self._set_stage_note(f"输出摘要：{summary}", tooltip=body)
+            return
+        if raw.startswith("[工作台] 当前运行目录根："):
+            self._set_stage_note(raw.replace("[工作台] ", "", 1), tooltip=raw)
 
     def _browse_output_dir(self) -> None:
         current = self.output_dir_edit.text().strip() or os.getcwd()
@@ -1146,6 +1330,8 @@ class SettingsPage(QWidget):
         self.claude_default_model.setPlaceholderText("未填写时使用环境变量中的默认 Claude 模型")
         self.default_effort = QComboBox()
         _populate_effort_combo(self.default_effort)
+        self.default_review_profile = QComboBox()
+        _populate_review_profile_combo(self.default_review_profile)
         self.claude_sdk_base_url = QLineEdit()
         self.claude_sdk_base_url.setPlaceholderText("可选，自定义 Claude 服务地址")
         self.claude_sdk_auth_token = QLineEdit()
@@ -1187,6 +1373,7 @@ class SettingsPage(QWidget):
         _configure_form_layout(claude_form)
         _pin_form_field_height(self.claude_default_model)
         _pin_form_field_height(self.default_effort)
+        _pin_form_field_height(self.default_review_profile)
         _pin_form_field_height(self.claude_sdk_base_url)
         _pin_form_field_height(self.claude_sdk_auth_token)
         _pin_form_field_height(self.claude_bin)
@@ -1194,6 +1381,7 @@ class SettingsPage(QWidget):
         claude_form.addRow("Claude 服务地址", self.claude_sdk_base_url)
         claude_form.addRow("Claude 访问凭证", self.claude_sdk_auth_token)
         claude_form.addRow("默认审查仔细程度", self.default_effort)
+        claude_form.addRow("默认审查策略", self.default_review_profile)
         claude_layout.addLayout(claude_form)
 
         self.claude_advanced_toggle = QPushButton("显示高级设置")
@@ -1244,6 +1432,10 @@ class SettingsPage(QWidget):
         self.guidance = QLabel("")
         self.guidance.setObjectName("MutedLabel")
         toolchain_layout.addWidget(self.guidance)
+        self.runtime_label = QLabel("")
+        self.runtime_label.setObjectName("MutedLabel")
+        self.runtime_label.setWordWrap(True)
+        toolchain_layout.addWidget(self.runtime_label)
 
         instruction_card = SurfaceFrame("card")
         instruction_layout = QVBoxLayout(instruction_card)
@@ -1301,6 +1493,7 @@ class SettingsPage(QWidget):
         _set_combo_value(self.default_progress, settings.default_progress_level or "agent")
         self.default_timeout.setValue(settings.default_timeout_sec or 1800)
         _set_combo_value(self.default_effort, settings.default_effort or "low")
+        _set_combo_value(self.default_review_profile, settings.default_review_profile or "thorough")
         self.output_dir.setText(settings.default_output_dir)
         self.claude_bin.setText(settings.claude_bin)
         self.opencode_bin.setText(settings.opencode_bin)
@@ -1310,6 +1503,7 @@ class SettingsPage(QWidget):
         self.default_instruction.setPlainText(settings.default_instruction)
         self.default_user_instruction.setPlainText(settings.default_user_instruction)
         self._apply_backend_mode(backend)
+        self._refresh_runtime_notice()
 
     def snapshot(self, previous: DesktopSettings) -> DesktopSettings:
         backend = _combo_value(self.default_backend)
@@ -1324,6 +1518,7 @@ class SettingsPage(QWidget):
             default_progress_level=_combo_value(self.default_progress),
             default_timeout_sec=self.default_timeout.value(),
             default_effort=_combo_value(self.default_effort),
+            default_review_profile=_combo_value(self.default_review_profile),
             default_instruction=self.default_instruction.toPlainText().strip(),
             default_user_instruction=self.default_user_instruction.toPlainText().strip(),
             claude_sdk_base_url=self.claude_sdk_base_url.text().strip(),
@@ -1347,15 +1542,27 @@ class SettingsPage(QWidget):
             self.backend_section_title.setText("OpenCode 默认设置")
             self.backend_stack.setCurrentIndex(1)
             self.guidance.setText("这里保存 OpenCode 的默认模型和服务地址；访问密钥只保留在当前窗口。")
+            self._refresh_runtime_notice()
             return
 
         self.backend_section_title.setText("Claude 默认设置")
         self.backend_stack.setCurrentIndex(0)
         self.guidance.setText("这里保存 Claude 的默认模型和服务地址；访问凭证只保留在当前窗口。")
+        self._refresh_runtime_notice()
 
     def _toggle_claude_advanced(self, checked: bool) -> None:
         self.claude_advanced_panel.setVisible(bool(checked))
         self.claude_advanced_toggle.setText("隐藏高级设置" if checked else "显示高级设置")
+
+    def _refresh_runtime_notice(self) -> None:
+        info = runtime_root_status()
+        root = str(info.get("root", "") or "")
+        writable = bool(info.get("writable", False))
+        if not bool(info.get("managed", False)):
+            self.runtime_label.setText("开发态：默认沿用仓库/系统既有路径。")
+            return
+        state = "可写" if writable else "不可写"
+        self.runtime_label.setText(f"运行目录根：{root}（{state}）")
 
     def _path_row(self, line_edit: QLineEdit, browse_callback) -> QWidget:
         row = QWidget()
@@ -1538,7 +1745,12 @@ class MainWindow(QMainWindow):
         self.session_api_key = self.settings_page.session_api_key()
         self.session_claude_auth_token = self.settings_page.session_claude_auth_token()
         self._apply_claude_sdk_env()
-        self.store.save(self.settings)
+        try:
+            self.store.save(self.settings)
+        except Exception as exc:  # noqa: BLE001
+            self.status_badge.setText("保存失败")
+            QMessageBox.critical(self, "默认设置保存失败", str(exc))
+            return
         self.review_page.load_settings(self.settings)
         self.status_badge.setText("默认设置已保存")
         QMessageBox.information(self, "默认设置已保存", "工作台默认设置已更新。")
@@ -1609,6 +1821,9 @@ class MainWindow(QMainWindow):
             self.home_page.set_recent(result)
             self.settings.last_batch_summary = str(result.batch_summary_path)
             self.settings.last_output_dir = str(result.output_dir)
-            self.store.save(self.settings)
+            try:
+                self.store.save(self.settings)
+            except Exception as exc:  # noqa: BLE001
+                self.review_page.append_progress(f"[工作台] 保存最近结果失败：{exc}", "basic")
             self._set_current_page(2)
         self._worker = None

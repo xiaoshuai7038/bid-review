@@ -1,4 +1,4 @@
-from app.gui.state.settings import DesktopSettings, SettingsStore, runtime_root, workspace_root
+from app.gui.state.settings import DesktopSettings, SettingsStore, runtime_root, runtime_root_status, workspace_root
 
-__all__ = ["DesktopSettings", "SettingsStore", "runtime_root", "workspace_root"]
+__all__ = ["DesktopSettings", "SettingsStore", "runtime_root", "runtime_root_status", "workspace_root"]
 

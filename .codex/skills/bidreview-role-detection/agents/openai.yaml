@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bidreview Role Detect"
+  short_description: "Detect tender and bid roles"
+  default_prompt: "Use $bidreview-role-detection to classify tender and bid files."

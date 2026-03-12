@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from app.llm.prompt_store import render_prompt
-from app.review.claude_review import _collect_tender_outline, run_bid_review_with_claude
+from app.review.claude_review import _collect_tender_outline, _parse_review_report_from_raw, run_bid_review_with_claude
 
 
 class _FakeClient:
@@ -36,6 +36,16 @@ class _FakeClient:
 
     def get_last_tool_uses(self) -> list[dict[str, Any]]:
         return list(self._tool_uses)
+
+    def repair_json_text(
+        self,
+        raw_text: str,
+        *,
+        required_top_keys: list[str] | None = None,
+        parse_error: str = "",
+        task_label: str | None = None,
+    ) -> dict[str, Any] | list[Any]:
+        raise AssertionError("repair_json_text should not be called in this test")
 
 
 class _SeqClient:
@@ -67,6 +77,34 @@ class _SeqClient:
 
     def get_last_tool_uses(self) -> list[dict[str, Any]]:
         return list(self._tool_uses)
+
+    def repair_json_text(
+        self,
+        raw_text: str,
+        *,
+        required_top_keys: list[str] | None = None,
+        parse_error: str = "",
+        task_label: str | None = None,
+    ) -> dict[str, Any] | list[Any]:
+        raise AssertionError("repair_json_text should not be called in these tests")
+
+
+class _RepairingClient(_FakeClient):
+    def __init__(self, repaired: dict[str, Any]) -> None:
+        super().__init__("unused")
+        self.repaired = repaired
+        self.repair_calls = 0
+
+    def repair_json_text(
+        self,
+        raw_text: str,
+        *,
+        required_top_keys: list[str] | None = None,
+        parse_error: str = "",
+        task_label: str | None = None,
+    ) -> dict[str, Any] | list[Any]:
+        self.repair_calls += 1
+        return self.repaired
 
 
 def test_review_main_prompt_requires_field_level_template_checks() -> None:
@@ -191,6 +229,28 @@ def test_run_bid_review_retries_when_review_completion_gate_fails(
     assert client.ask_text_calls == 2
     assert "[COMPLETION_RETRY]" in raw
     assert len(report["requirements"]) == 6
+
+
+def test_parse_review_report_from_raw_uses_json_repair_before_full_retry(tmp_path: Path) -> None:
+    repaired = {
+        "requirements": [{"id": "R001", "category": "响应格式", "text": "投标函应按格式填写", "source": "s"}],
+        "findings": [],
+        "summary": {"requirement_count": 1, "finding_count": 0},
+    }
+    client = _RepairingClient(repaired)
+
+    report, raw = _parse_review_report_from_raw(
+        raw_output='{"requirements":[{"id":"R001","text":"投标函中"致"字段错误"}],"findings":[],"summary":{}}',
+        prompt="ignored",
+        client=client,
+        backend_name="Claude",
+        tender_path=tmp_path / "tender.pdf",
+        bid_path=tmp_path / "bid.docx",
+    )
+
+    assert client.repair_calls == 1
+    assert "[JSON_REPAIRED]" in raw
+    assert report["requirements"][0]["text"] == "投标函应按格式填写"
 
 
 def test_collect_tender_outline_prefers_real_major_chapters_over_toc_noise(

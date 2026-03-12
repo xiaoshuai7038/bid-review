@@ -9,6 +9,14 @@ class _UnavailableClient:
     def available(self) -> bool:
         return False
 
+    def unavailable_reason(self) -> str | None:
+        return None
+
+
+class _UnavailableClaudeClientWithReason(_UnavailableClient):
+    def unavailable_reason(self) -> str | None:
+        return "Claude Code on Windows requires git-bash."
+
 
 def _pipeline_kwargs(tmp_path) -> dict:
     return {
@@ -50,5 +58,17 @@ def test_claude_unavailable_error_message_mentions_sdk(
         lambda **kwargs: ("claude", _UnavailableClient()),
     )
     with pytest.raises(RuntimeError, match="未检测到可用的 Claude SDK 运行时"):
+        orchestrator.run_pipeline(**_pipeline_kwargs(tmp_path))
+
+
+def test_claude_unavailable_error_uses_specific_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        orchestrator,
+        "create_llm_client",
+        lambda **kwargs: ("claude", _UnavailableClaudeClientWithReason()),
+    )
+    with pytest.raises(RuntimeError, match="git-bash"):
         orchestrator.run_pipeline(**_pipeline_kwargs(tmp_path))
 

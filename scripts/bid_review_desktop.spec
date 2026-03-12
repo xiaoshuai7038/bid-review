@@ -1,6 +1,8 @@
+import os
 from pathlib import Path
 
 import PySide6
+import claude_agent_sdk
 from PyInstaller.utils.hooks import collect_data_files
 
 
@@ -8,6 +10,9 @@ project_root = Path.cwd()
 datas = collect_data_files("app")
 pyside_root = Path(PySide6.__file__).resolve().parent
 shiboken_root = pyside_root.parent / "shiboken6"
+claude_sdk_root = Path(claude_agent_sdk.__file__).resolve().parent
+bundled_cli_name = "claude.exe" if os.name == "nt" else "claude"
+bundled_cli_path = claude_sdk_root / "_bundled" / bundled_cli_name
 for source, destination in [
     (pyside_root / "__init__.py", "PySide6"),
     (pyside_root / "_config.py", "PySide6"),
@@ -21,6 +26,8 @@ for source, destination in [
 ]:
     if source.exists():
         datas.append((str(source), destination))
+if bundled_cli_path.exists():
+    datas.append((str(bundled_cli_path), "claude_agent_sdk/_bundled"))
 binaries = [
     (str(pyside_root / "pyside6.abi3.dll"), "PySide6"),
 ]
@@ -35,7 +42,7 @@ for source, destination in [
     if source.exists():
         binaries.append((str(source), destination))
 
-a = Analysis(
+desktop_analysis = Analysis(
     [str(project_root / "app" / "gui" / "main.py")],
     pathex=[str(project_root)],
     binaries=binaries,
@@ -58,10 +65,27 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
-pyz = PYZ(a.pure)
-exe = EXE(
-    pyz,
-    a.scripts,
+runtime_host_analysis = Analysis(
+    [str(project_root / "app" / "runtime_host.py")],
+    pathex=[str(project_root)],
+    binaries=[],
+    datas=[],
+    hiddenimports=[
+        "app.mcp_servers.document_parser_server",
+        "app.mcp_servers.paddle_ocr_server",
+    ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+desktop_pyz = PYZ(desktop_analysis.pure)
+runtime_host_pyz = PYZ(runtime_host_analysis.pure)
+desktop_exe = EXE(
+    desktop_pyz,
+    desktop_analysis.scripts,
     [],
     exclude_binaries=True,
     name="BidReviewDesktop",
@@ -71,10 +95,26 @@ exe = EXE(
     upx=False,
     console=False,
 )
+runtime_host_exe = EXE(
+    runtime_host_pyz,
+    runtime_host_analysis.scripts,
+    [],
+    exclude_binaries=True,
+    name="BidReviewRuntimeHost",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=True,
+    hide_console="hide-early",
+)
 coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
+    desktop_exe,
+    runtime_host_exe,
+    desktop_analysis.binaries,
+    desktop_analysis.datas,
+    runtime_host_analysis.binaries,
+    runtime_host_analysis.datas,
     strip=False,
     upx=False,
     name="BidReviewDesktop",

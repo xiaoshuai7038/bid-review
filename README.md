@@ -110,7 +110,19 @@ GUI 功能范围：
 - 查看 `summary / findings`
 - 直接打开 `review_report.json / review_report.md / review_report.docx / batch_summary.json`
 
-GUI 本地设置会保存在系统 AppData 目录，不写入仓库。
+GUI 开发态本地设置默认保存在系统 AppData 目录，不写入仓库。
+冻结态（打包后的 EXE）默认会把本项目自有运行产物写入 EXE 同级的 `runtime/` 目录，例如：
+
+- `runtime/output/`
+- `runtime/settings/`
+- `runtime/tmp/document-parser/`
+- `runtime/tmp/ocr/`
+
+如需显式覆盖运行目录根，可设置：
+
+```powershell
+$env:BID_REVIEW_RUNTIME_ROOT = "D:\BidReviewDesktop\runtime"
+```
 
 如需做无头 smoke test 并截图：
 
@@ -253,6 +265,19 @@ uv run python -m app.main `
 
 当前默认推荐的是客户可交付的稳定 `onedir` 包。
 该产物不依赖仓库源码、`.venv`、`uv` 或本地 Python，适合直接交付到新的 Windows 客户机。
+桌面包会同时内置：
+
+- `Claude Agent SDK` 所需的 bundled `claude.exe`
+- 项目内置 MCP 的 runtime host：`BidReviewRuntimeHost.exe`
+- 供 `Claude Code` 在 Windows 上使用的 portable Git Bash runtime：`third-party\git\`
+
+其中 `BidReviewRuntimeHost.exe` 仅供桌面程序在后台拉起 `document-parser` / `paddle-ocr` MCP 使用，用户无需手动启动。
+Windows 客户机默认无需再单独安装 Git for Windows；桌面包会优先使用包内 `third-party\git\bin\bash.exe`。
+如需手工覆盖，也可显式设置：
+
+```powershell
+$env:CLAUDE_CODE_GIT_BASH_PATH = "C:\Program Files\Git\bin\bash.exe"
+```
 
 首期客户交付范围：
 
@@ -306,11 +331,86 @@ dist\BidReviewDesktopLauncher\BidReviewDesktopLauncher.exe
 
 `launcher` 依赖仓库根目录和 `.venv`，只适合项目开发或内部调试，不适合直接交付客户。
 
+### portable Git 来源
+
+默认打包流程会优先从当前构建机已安装的 Git for Windows 根目录准备 portable Git runtime，
+再将其复制到桌面交付目录的 `third-party\git\`。
+
+如当前构建机上的 Git 不在常见位置，可显式传入：
+
+```powershell
+.\scripts\build-desktop.ps1 -PortableGitRoot "C:\Program Files\Git"
+```
+
+打包后的 `third-party\git\` 会保留 Git 自带许可证文件，并额外生成：
+
+```text
+third-party\git\BID_REVIEW_PORTABLE_GIT.txt
+```
+
+用于记录本次打包使用的 Git 来源路径与版本。
+
+### 运行期目录说明
+
+冻结态 `BidReviewDesktop.exe` 默认会优先将本项目自有运行产物写入 EXE 同级目录下的 `runtime/` 子目录，而不是：
+
+- `Documents\BidReview\output`
+- `%LOCALAPPDATA%\Temp\word_images_*`
+- `%LOCALAPPDATA%\Temp\ocr_upload_*`
+- `%LOCALAPPDATA%\Temp\ocr_pdf_pages_*`
+
+当前默认治理范围仅覆盖本项目自有路径：
+
+- 审查结果输出
+- GUI 设置文件
+- Word 图片提取临时目录
+- OCR 上传缓存与 PDF 渲染临时目录
+
+对于第三方运行时目录：
+
+- Claude Code / Claude SDK 运行时的 `~/.claude/projects/.../tool-results`
+- OpenCode 自身的 storage/cache/log
+
+项目会尽量提供实验性配置入口，但不保证所有第三方目录都能完全迁离用户目录；实际能力以所用运行时版本是否支持为准。
+
+实验性可验证入口：
+
+```powershell
+$env:CLAUDE_CONFIG_DIR = "D:\BidReviewDesktop\runtime\third-party\claude"
+```
+
+OpenCode 侧当前会尝试向内联配置中注入：
+
+```json
+{
+  "data": {
+    "directory": "D:/BidReviewDesktop/runtime/third-party/opencode/data"
+  }
+}
+```
+
+但这部分不是默认开启：
+
+- 当前版本 OpenCode 在真实实验中会对 `data` 键报错：`Unrecognized key: "data"`
+- 因此项目仅保留实验性开关，不默认注入
+
+如需自行验证，可显式开启：
+
+```powershell
+$env:BID_REVIEW_ENABLE_OPENCODE_DATA_DIRECTORY = "1"
+```
+
+是否会影响 OpenCode 的全部 project storage/cache/log，仍需以真实运行验证为准。
+
 ## 环境要求
+
+以下要求针对源码开发、CLI 运行和本地重新打包；不适用于已经构建好的客户交付 `onedir` 桌面包。
+客户机直接运行 `dist\BidReviewDesktop\BidReviewDesktop.exe` 时，不需要额外安装 Python、`uv`、仓库源码或全局 `claude` CLI。
 
 - Python 3.10+
 - `uv`（已用于环境和依赖管理）
 - `claude` 后端无需额外全局安装 `claude` CLI；执行 `uv sync` 后会安装项目依赖中的 `claude-agent-sdk`
+- 若重新打包桌面交付包，构建机需能提供 Git for Windows runtime（默认会自动探测本机 Git 安装目录，或通过 `-PortableGitRoot` 指定）
 - 使用 `claude` 后端时，需配置 `ANTHROPIC_AUTH_TOKEN`
 - 可选：`ANTHROPIC_MODEL`
 - 可选：`ANTHROPIC_BASE_URL`

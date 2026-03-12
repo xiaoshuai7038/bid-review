@@ -25,6 +25,15 @@ from app.llm.claude_client import (
     prompt_safe_path,
 )
 from app.llm.prompt_store import render_prompt
+from app.review.execution_policy import ReviewExecutionPolicy, normalize_review_profile
+from app.review.prepared_artifacts import (
+    extract_or_load_word_image_manifest,
+    file_sha256,
+    load_or_build_bid_artifact,
+    load_or_build_tender_artifact,
+    ocr_backend_fingerprint,
+    ocr_cache_file,
+)
 
 
 _CONTEXT_REQUIREMENT_CATEGORY = "主体一致性"
@@ -168,8 +177,14 @@ _IMAGE_SUFFIXES = {
 
 _CLAUDE_SDK_REVIEW_TOOL_ALLOWLIST = ",".join(
     [
+        "document-parser.get_pdf_outline",
         "document-parser.read_pdf",
+        "document-parser.read_pdf_pages",
+        "document-parser.search_pdf_text",
+        "document-parser.get_word_outline",
         "document-parser.read_word",
+        "document-parser.read_word_section",
+        "document-parser.search_word_text",
         "document-parser.extract_images_from_word",
         "paddle-ocr.ocr_images_in_dir",
         "paddle-ocr.ocr_pdf",
@@ -687,35 +702,10 @@ def _build_pdf_line_index(path_str: str) -> list[dict[str, Any]]:
     if not path.exists() or path.suffix.lower() != ".pdf":
         return []
     try:
-        from pypdf import PdfReader
+        artifact = load_or_build_tender_artifact(path).data
     except Exception:  # noqa: BLE001
         return []
-
-    out: list[dict[str, Any]] = []
-    try:
-        reader = PdfReader(str(path))
-    except Exception:  # noqa: BLE001
-        return []
-
-    for page_no, page in enumerate(reader.pages, start=1):
-        try:
-            page_text = page.extract_text() or ""
-        except Exception:  # noqa: BLE001
-            continue
-        lines = [_clean_text(x) for x in page_text.splitlines()]
-        lines = [x for x in lines if x]
-        for line_no, line_text in enumerate(lines, start=1):
-            out.append(
-                {
-                    "kind": "pdf",
-                    "page_no": page_no,
-                    "line_no": line_no,
-                    "section": "",
-                    "text": line_text,
-                    "norm": _normalize_search_text(line_text),
-                }
-            )
-    return out
+    return list(artifact.get("line_index", []))
 
 
 @lru_cache(maxsize=32)
@@ -723,58 +713,17 @@ def _build_word_line_index(path_str: str) -> list[dict[str, Any]]:
     path = Path(path_str)
     if not path.exists() or path.suffix.lower() != ".docx":
         return []
-
-    out: list[dict[str, Any]] = []
-    current_section = "文档开头"
-    section_line_no = 0
-
-    def _push_line(raw_text: str) -> None:
-        nonlocal current_section, section_line_no
-        line_text = _clean_text(raw_text)
-        if not line_text:
-            return
-        if _looks_like_section_heading(line_text):
-            current_section = line_text
-            section_line_no = 0
-        section_line_no += 1
-        out.append(
-            {
-                "kind": "word",
-                "page_no": 0,
-                "line_no": section_line_no,
-                "section": current_section,
-                "text": line_text,
-                "norm": _normalize_search_text(line_text),
-            }
-        )
-
     try:
-        doc = Document(str(path))
+        artifact = load_or_build_bid_artifact(path).data
     except Exception:  # noqa: BLE001
         return []
-
-    body = getattr(doc.element, "body", None)
-    if body is None:
-        return out
-
-    for child in body.iterchildren():
-        if isinstance(child, CT_P):
-            _push_line(Paragraph(child, doc).text)
-            continue
-        if not isinstance(child, CT_Tbl):
-            continue
-        table = Table(child, doc)
-        for row in table.rows:
-            row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
-            _push_line(row_text)
-    return out
+    return list(artifact.get("line_index", []))
 
 
 def _collect_tender_outline(path: Path) -> dict[str, Any]:
     line_index = _build_pdf_line_index(str(path.resolve()))
     if not line_index:
         return {"total_pages": 0, "sections": [], "relevant_sections": []}
-
     total_pages = max(int(item.get("page_no", 0) or 0) for item in line_index)
     seen: set[str] = set()
     sections: list[dict[str, Any]] = []
@@ -791,7 +740,6 @@ def _collect_tender_outline(path: Path) -> dict[str, Any]:
         sections.append({"title": text, "page_no": int(item.get("page_no", 0) or 0)})
         if len(sections) >= 40:
             break
-
     relevant_keywords = (
         "投标人须知",
         "投标文件格式",
@@ -1026,34 +974,37 @@ def _append_completion_enforcement(
     reasons: list[str],
 ) -> str:
     reason_block = "\n".join(f"- {item}" for item in reasons[:8])
-    enforce = f"""
+    return f"""
+你正在修复上一轮“全文阅读完成门槛”未通过的初审结果。不要重做整份报告总结，只补足缺口并输出完整 JSON。
 
-[全文阅读完成门槛补充要求]
-你上一轮结果未通过完成门槛：
+未通过原因：
 {reason_block}
 
-请重新继续阅读，不要复用上一轮的半成品总结。你必须满足以下条件后才能输出最终 JSON：
-1. 先完成招标文件全文结构盘点，并确认总页数与关键章节覆盖。
-2. 再完成招标文件硬性要求全文提取；最终 `requirements` 不得少于 {min_requirement_count} 条，除非你已经读完整份文档且文档本身确实明显少于此数量。
-3. 再完成投标文件正文结构盘点；若是 docx，必须在全量 OCR 完成后重新回到正文和模板字段继续审查。
-4. 对已出现明确字段和值的位置（如 `致：`、`开户银行：`、`项目名称：`、`账号：`），必须先做字段级判断，禁止再输出泛化“需人工核验主体一致性/项目信息一致性”来代替。
-5. 你必须在 `summary.review_scope` 中如实返回：
+要求：
+1. 继续基于原任务读取缺失部分，而不是重写已经完成的部分。
+2. 最终 `requirements` 不得少于 {min_requirement_count} 条，除非你已经读完整份文档且文档本身确实明显少于此数量。
+3. 对已出现明确字段和值的位置（如 `致：`、`开户银行：`、`项目名称：`、`账号：`），必须先做字段级判断，禁止输出泛化“需人工核验主体一致性/项目信息一致性”。
+4. 必须在 `summary.review_scope` 中如实返回：
    - `tender_total_pages_seen`
    - `tender_sections_reviewed`
    - `bid_sections_reviewed`
    - `docx_image_count_seen`
    - `docx_ocr_completed`
    - `completion_check_passed`
-
-重新审查时，请以以下结构地图为起点继续完成全文阅读：
+5. 优先使用结构化读取工具：
+   - PDF：`get_pdf_outline` -> `read_pdf_pages` -> `search_pdf_text`
+   - Word：`get_word_outline` -> `read_word_section` -> `search_word_text`
+6. Bash 仅可用于极少量只读定位，禁止长期围绕 tool-results 文件做 grep/sed/awk 链式翻找。
 
 [招标文件结构地图]
 {tender_document_map}
 
 [投标文件结构地图]
 {bid_document_map}
+
+[原任务上下文摘要]
+{compact_text_for_prompt(prompt, 3000)}
 """
-    return prompt + enforce
 
 
 def _extract_location_tokens(text: str) -> list[str]:
@@ -1276,10 +1227,11 @@ def _append_precise_location_enforcement(
     if bid_path.suffix.lower() == ".docx":
         bid_format = "投标文件《章节名》Lm-Ln：关键原文"
     gap_block = "\n".join(f"- {g}" for g in gaps[:8])
-    enforce = f"""
-
+    return f"""
 [证据精确定位强制要求]
-你上一次返回的部分 evidence 仍然只有粗粒度定位。请重新读取原始文档，并严格按以下格式输出：
+你正在修复上一轮审查结果中的 evidence 精确定位缺口。不要重做整份审查，只补足缺少精确定位的 evidence。
+
+严格格式要求：
 - 招标文件 PDF 证据：`招标文件第X页 Lm-Ln：关键原文`
 - 投标文件证据：`{bid_format}`
 - OCR 图片证据：`投标文件第X页图片OCR Lm-Ln：关键原文`；若无法确定页码，则写 `投标文件《章节名》图片OCR Lm-Ln：关键原文`
@@ -1289,17 +1241,73 @@ def _append_precise_location_enforcement(
 - `read_word` 的每个章节/小节/模板标题块内，按换行编号为 `L1, L2, ...`
 - OCR 文本按每个图片或每页 OCR 的换行编号为 `L1, L2, ...`
 
-禁止继续使用以下粗粒度格式：
+禁止继续使用：
 - `P15`
 - `第3页`
 - `资格审查申请书P3`
 - `第六章`
 - `缺少定位信息`
 
-以下 finding 上一次仍缺少精确定位，请重点修正：
+以下 finding 仍缺少精确定位，请重点修正：
 {gap_block}
+
+优先使用结构化读取工具，不要把 Bash 当主阅读路径。
+
+[原任务上下文摘要]
+{compact_text_for_prompt(prompt, 2400)}
 """
-    return prompt + enforce
+
+
+def _ocr_backend_url_for_metrics() -> str:
+    return os.getenv("OCRMCP_BACKEND_URL", "https://u372299-h9rw-37d89577.westd.seetacloud.com:8443")
+
+
+def _estimate_ocr_cache_metrics(
+    image_manifest: dict[str, Any] | None,
+    *,
+    policy: ReviewExecutionPolicy,
+) -> dict[str, Any]:
+    if not image_manifest:
+        return {
+            "image_count_raw": 0,
+            "image_count_unique": 0,
+            "image_count_skipped": 0,
+            "ocr_cache_hit_count": 0,
+            "ocr_remote_batch_count": 0,
+            "ocr_remote_duration_ms": 0,
+        }
+    image_paths = [str(x) for x in image_manifest.get("image_paths", []) if str(x or "").strip()]
+    cache_hits = 0
+    for image_path in image_paths:
+        try:
+            image_hash = file_sha256(Path(image_path))
+        except Exception:  # noqa: BLE001
+            continue
+        cache_path = ocr_cache_file(
+            image_hash,
+            language="ch",
+            backend_url=_ocr_backend_url_for_metrics(),
+        )
+        if cache_path.exists():
+            cache_hits += 1
+    remote_file_count = max(0, len(image_paths) - cache_hits)
+    chunk_size = max(1, policy.ocr_concurrency.chunk_size)
+    remote_batches = (remote_file_count + chunk_size - 1) // chunk_size if remote_file_count else 0
+    return {
+        "image_count_raw": int(image_manifest.get("image_count_raw", 0) or 0),
+        "image_count_unique": int(image_manifest.get("image_count_unique", 0) or 0),
+        "image_count_skipped": int(image_manifest.get("image_count_skipped", 0) or 0),
+        "ocr_cache_hit_count": cache_hits,
+        "ocr_remote_batch_count": remote_batches,
+        "ocr_remote_duration_ms": 0,
+    }
+
+
+def _record_last_review_metrics(client: Any, metrics: dict[str, Any]) -> None:
+    try:
+        setattr(client, "_last_review_metrics", dict(metrics))
+    except Exception:
+        pass
 
 
 def _collect_review_guard_state(
@@ -2946,16 +2954,34 @@ def _parse_review_report_from_raw(
 ) -> tuple[dict[str, Any], str]:
     try:
         data = extract_json_payload(raw_output)
-    except Exception:  # noqa: BLE001
-        data = client.ask_json(
-            prompt,
-            required_top_keys=["requirements", "findings", "summary"],
-            task_label=f"初审(JSON重试)：{bid_path.name}",
-        )
-        raw_output = (
-            f"{raw_output}\n\n[JSON_FALLBACK]\n"
-            + json.dumps(data, ensure_ascii=False, indent=2)
-        )
+    except Exception as exc:  # noqa: BLE001
+        repaired = None
+        if hasattr(client, "repair_json_text"):
+            try:
+                repaired = client.repair_json_text(
+                    raw_output,
+                    required_top_keys=["requirements", "findings", "summary"],
+                    parse_error=f"{type(exc).__name__}: {exc}",
+                    task_label=f"初审(JSON修复)：{bid_path.name}",
+                )
+            except Exception:  # noqa: BLE001
+                repaired = None
+        if repaired is not None:
+            data = repaired
+            raw_output = (
+                f"{raw_output}\n\n[JSON_REPAIRED]\n"
+                + json.dumps(data, ensure_ascii=False, indent=2)
+            )
+        else:
+            data = client.ask_json(
+                prompt,
+                required_top_keys=["requirements", "findings", "summary"],
+                task_label=f"初审(JSON重试)：{bid_path.name}",
+            )
+            raw_output = (
+                f"{raw_output}\n\n[JSON_FALLBACK]\n"
+                + json.dumps(data, ensure_ascii=False, indent=2)
+            )
     if not isinstance(data, dict):
         raise ValueError(f"{backend_name} 返回的审查结果不是 JSON 对象。")
     for key in ("requirements", "findings", "summary"):
@@ -3063,10 +3089,39 @@ def run_bid_review_with_claude(
     client: Any,
     extra_instruction: str = "",
     user_instruction: str = "",
+    review_profile: str | None = None,
 ) -> tuple[dict[str, Any], str]:
     backend_name = "OpenCode" if client.__class__.__name__.lower().startswith("opencode") else "Claude"
     tender_path_obj = Path(tender_path).resolve()
     bid_path_obj = Path(bid_path).resolve()
+    policy = ReviewExecutionPolicy.for_profile(
+        normalize_review_profile(review_profile or os.getenv("BID_REVIEW_REVIEW_PROFILE", "thorough"))
+    )
+    prepare_started = time.perf_counter()
+    try:
+        if tender_path_obj.exists():
+            tender_prepared = load_or_build_tender_artifact(tender_path_obj)
+        else:
+            raise FileNotFoundError
+    except Exception:  # noqa: BLE001
+        tender_prepared = type("Prepared", (), {"data": {"file_hash": ""}, "cache_hit": False})()
+    try:
+        if bid_path_obj.exists():
+            bid_prepared = load_or_build_bid_artifact(bid_path_obj)
+        else:
+            raise FileNotFoundError
+    except Exception:  # noqa: BLE001
+        bid_prepared = type("Prepared", (), {"data": {"file_hash": ""}, "cache_hit": False})()
+    image_manifest_prepared: dict[str, Any] | None = None
+    if bid_path_obj.suffix.lower() == ".docx" and bid_path_obj.exists():
+        try:
+            image_manifest_prepared = extract_or_load_word_image_manifest(
+                bid_path_obj,
+                filter_policy=policy.ocr_filter_policy,
+            ).data
+        except Exception:  # noqa: BLE001
+            image_manifest_prepared = None
+    prepare_duration_ms = int((time.perf_counter() - prepare_started) * 1000)
     workspace_dir = prompt_safe_path(str(tender_path_obj.parent))
     tender_stem = tender_path_obj.stem
     bid_stem = bid_path_obj.stem
@@ -3105,12 +3160,32 @@ def run_bid_review_with_claude(
     )
     word_ocr_fully_covered = not (ocr_required and require_word_extract)
     original_timeout = client.timeout_sec
+    metrics: dict[str, Any] = {
+        "review_profile": policy.review_profile,
+        "prepare": {
+            "duration_ms": prepare_duration_ms,
+            "tender_file_hash": tender_prepared.data.get("file_hash", ""),
+            "bid_file_hash": bid_prepared.data.get("file_hash", ""),
+        },
+        "pdf_cache_hit": bool(tender_prepared.cache_hit),
+        "word_cache_hit": bool(bid_prepared.cache_hit) if require_word_extract else False,
+        "initial_review_duration_ms": 0,
+        "review_attempt_count": 1,
+        "json_repair_count": 0,
+        "completion_retry_count": 0,
+        "location_retry_count": 0,
+        "second_pass_used": False,
+        "tool_usage_summary": {},
+        "token_usage_summary": {},
+    }
+    metrics.update(_estimate_ocr_cache_metrics(image_manifest_prepared, policy=policy))
     # OCR全量处理（特别是docx图片较多时）需要更长超时，避免中途失败。
     if ocr_required and require_word_extract and client.timeout_sec < 7200:
         client.timeout_sec = 7200
     try:
         with _prefer_claude_sdk_review_tools(client):
             prompt = _append_no_write_enforcement(prompt)
+            initial_review_started = time.perf_counter()
             raw_output = client.ask_text(prompt, task_label=f"初审：{bid_path_obj.name}")
             first_guard = _collect_review_guard_state(
                 tool_calls=client.get_last_tool_calls(),
@@ -3121,6 +3196,7 @@ def run_bid_review_with_claude(
             )
             need_retry = bool(first_guard.get("has_forbidden_write", False)) or not bool(first_guard.get("ocr_guard_ok", True))
             if need_retry:
+                metrics["review_attempt_count"] = int(metrics.get("review_attempt_count", 1) or 1) + 1
                 retry_prompt = prompt
                 if not bool(first_guard.get("ocr_guard_ok", True)):
                     retry_prompt = _append_ocr_enforcement(retry_prompt, require_word_extract=require_word_extract)
@@ -3172,7 +3248,7 @@ def run_bid_review_with_claude(
                 tender_path=tender_path_obj,
                 bid_path=bid_path_obj,
             )
-            if _completion_gate_enabled():
+            if policy.enable_completion_retry and _completion_gate_enabled():
                 raw_data = extract_json_payload(raw_output)
                 completion_failures = _evaluate_review_completion(
                     raw_data,
@@ -3183,6 +3259,7 @@ def run_bid_review_with_claude(
                     ocr_required=ocr_required,
                 )
                 if completion_failures:
+                    metrics["completion_retry_count"] = int(metrics.get("completion_retry_count", 0) or 0) + 1
                     completion_retry_prompt = _append_completion_enforcement(
                         prompt,
                         tender_document_map=tender_document_map,
@@ -3218,7 +3295,8 @@ def run_bid_review_with_claude(
                         )
                     raw_output = f"{raw_output}\n\n[COMPLETION_RETRY]\n{completion_retry_raw}"
             location_gaps = _find_precise_location_gaps(report, bid_path=bid_path_obj)
-            if location_gaps:
+            if policy.enable_location_retry and location_gaps:
+                metrics["location_retry_count"] = int(metrics.get("location_retry_count", 0) or 0) + 1
                 location_retry_prompt = _append_precise_location_enforcement(
                     prompt,
                     bid_path=bid_path_obj,
@@ -3263,17 +3341,24 @@ def run_bid_review_with_claude(
                         raw_output = f"{raw_output}\n\n[LOCATION_RETRY]\n{location_retry_raw}"
                     else:
                         raw_output = f"{raw_output}\n\n[LOCATION_RETRY_SKIPPED]\n{location_retry_raw}"
+            metrics["initial_review_duration_ms"] = int((time.perf_counter() - initial_review_started) * 1000)
     finally:
         client.timeout_sec = original_timeout
 
-    enable_second_pass = os.getenv("BID_REVIEW_ENABLE_SECOND_PASS", "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    second_pass_flag = os.getenv("BID_REVIEW_ENABLE_SECOND_PASS", "").strip().lower()
+    if second_pass_flag:
+        enable_second_pass = second_pass_flag in {"1", "true", "yes", "on"}
+    else:
+        enable_second_pass = policy.enable_second_pass
     force_manual_image_checks = require_word_extract and ocr_required and (not word_ocr_fully_covered)
     if not enable_second_pass:
+        metrics["tool_usage_summary"] = {
+            "tool_call_count": len(client.get_last_tool_calls()),
+            "tool_calls": client.get_last_tool_calls(),
+        }
+        metrics["token_usage_summary"] = getattr(client, "get_last_usage_summary", lambda: {})()
+        metrics["json_repair_count"] = raw_output.count("[JSON_REPAIRED]")
+        _record_last_review_metrics(client, metrics)
         report = _apply_stability_guards(
             report,
             tender_path=tender_path_obj,
@@ -3299,6 +3384,7 @@ def run_bid_review_with_claude(
     with _prefer_claude_sdk_review_tools(client):
         second_prompt = _append_no_write_enforcement(second_prompt)
         second_raw = client.ask_text(second_prompt, task_label=f"二次复核：{bid_path_obj.name}")
+        metrics["second_pass_used"] = True
         if _has_forbidden_write_tool_call(client.get_last_tool_uses()):
             second_retry = _append_no_write_enforcement(second_prompt)
             second_raw = client.ask_text(second_retry, task_label=f"二次复核重试(只读强制)：{bid_path_obj.name}")
@@ -3329,4 +3415,11 @@ def run_bid_review_with_claude(
     )
 
     merged_raw = f"{raw_output}\n\n[SECOND_PASS]\n{second_raw}"
+    metrics["tool_usage_summary"] = {
+        "tool_call_count": len(client.get_last_tool_calls()),
+        "tool_calls": client.get_last_tool_calls(),
+    }
+    metrics["token_usage_summary"] = getattr(client, "get_last_usage_summary", lambda: {})()
+    metrics["json_repair_count"] = merged_raw.count("[JSON_REPAIRED]")
+    _record_last_review_metrics(client, metrics)
     return report, merged_raw

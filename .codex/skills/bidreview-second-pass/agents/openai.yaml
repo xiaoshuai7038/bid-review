@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bidreview Second Pass"
+  short_description: "Find missed bid review issues"
+  default_prompt: "Use $bidreview-second-pass to run the additional-findings review pass."

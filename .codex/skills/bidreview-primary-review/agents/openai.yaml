@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bidreview Primary Review"
+  short_description: "Run first-pass bid review"
+  default_prompt: "Use $bidreview-primary-review to run the main bid review workflow."

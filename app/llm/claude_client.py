@@ -15,6 +15,16 @@ from typing import Any, Callable
 import anyio
 
 from app.llm.prompt_store import render_prompt
+from app.runtime_paths import (
+    CLAUDE_CONFIG_DIR_ENV,
+    CLAUDE_CODE_GIT_BASH_PATH_ENV,
+    RUNTIME_ROOT_ENV,
+    default_claude_bundled_cli_path,
+    default_claude_config_dir,
+    default_git_bash_path,
+    managed_runtime_enabled,
+    runtime_root,
+)
 
 
 class ClaudeCallError(RuntimeError):
@@ -116,6 +126,7 @@ class ClaudeClient:
     progress_callback: Callable[[str, str], None] | None = None
     _last_tool_calls: list[str] = field(default_factory=list, init=False, repr=False)
     _last_tool_uses: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
+    _last_usage_summary: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
 
     def _emit_progress(self, message: str, level: str = "normal") -> None:
         if not self.show_progress:
@@ -196,6 +207,9 @@ class ClaudeClient:
         return Path(next(iter(spec.submodule_search_locations)))
 
     def _bundled_cli_path(self) -> Path | None:
+        frozen_bundled = default_claude_bundled_cli_path()
+        if frozen_bundled is not None:
+            return frozen_bundled
         package_dir = self._sdk_package_dir()
         if package_dir is None:
             return None
@@ -204,6 +218,17 @@ class ClaudeClient:
         if bundled.exists() and bundled.is_file():
             return bundled
         return None
+
+    def _resolved_cli_path(self) -> str | None:
+        if self.claude_bin:
+            candidate = Path(self.claude_bin).expanduser().resolve()
+            if candidate.exists() and candidate.is_file():
+                return str(candidate)
+            return None
+        bundled = self._bundled_cli_path()
+        if bundled is not None:
+            return str(bundled)
+        return shutil.which("claude")
 
     def _load_sdk(self) -> dict[str, Any]:
         try:
@@ -245,16 +270,74 @@ class ClaudeClient:
         env_model = (os.getenv("ANTHROPIC_MODEL") or "").strip()
         return env_model or None
 
+    def _git_bash_path(self) -> Path | None:
+        if os.name != "nt":
+            return None
+        return default_git_bash_path()
+
+    def _missing_runtime_requirement(self) -> str | None:
+        try:
+            self._load_sdk()
+        except ClaudeCallError as exc:
+            return str(exc)
+
+        if self._resolved_cli_path() is None:
+            return (
+                "未检测到可用的 Claude SDK 运行时。请先执行 `uv sync` 安装依赖，"
+                "并配置 ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY。"
+            )
+
+        if os.name != "nt":
+            return None
+
+        explicit_git_bash = (os.getenv(CLAUDE_CODE_GIT_BASH_PATH_ENV) or "").strip()
+        if explicit_git_bash:
+            path_obj = Path(explicit_git_bash).expanduser().resolve(strict=False)
+            if path_obj.exists() and path_obj.is_file():
+                return None
+            return (
+                f"Claude Code 在 Windows 上需要 Git Bash，但环境变量 {CLAUDE_CODE_GIT_BASH_PATH_ENV} "
+                f"指向的文件不存在：{path_obj}"
+            )
+
+        if self._git_bash_path() is not None:
+            return None
+
+        return (
+            "Claude Code on Windows requires git-bash (https://git-scm.com/downloads/win). "
+            "Please install Git for Windows, or set environment variable "
+            f"{CLAUDE_CODE_GIT_BASH_PATH_ENV}=C:\\Program Files\\Git\\bin\\bash.exe"
+        )
+
+    def unavailable_reason(self) -> str | None:
+        return self._missing_runtime_requirement()
+
     def _build_sdk_env(self) -> dict[str, str]:
         env: dict[str, str] = {}
 
-        for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
+        for name in (
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            CLAUDE_CODE_GIT_BASH_PATH_ENV,
+        ):
             value = os.getenv(name)
             if value:
                 env[name] = value
 
         if "ANTHROPIC_API_KEY" not in env and "ANTHROPIC_AUTH_TOKEN" in env:
             env["ANTHROPIC_API_KEY"] = env["ANTHROPIC_AUTH_TOKEN"]
+
+        if managed_runtime_enabled():
+            env[RUNTIME_ROOT_ENV] = str(runtime_root())
+            claude_config_dir = default_claude_config_dir()
+            if claude_config_dir is not None:
+                env[CLAUDE_CONFIG_DIR_ENV] = str(claude_config_dir)
+
+        git_bash_path = self._git_bash_path()
+        if git_bash_path is not None and CLAUDE_CODE_GIT_BASH_PATH_ENV not in env:
+            env[CLAUDE_CODE_GIT_BASH_PATH_ENV] = str(git_bash_path)
 
         return env
 
@@ -304,7 +387,7 @@ class ClaudeClient:
             effort=self.effort or None,
             cwd=self.workspace or None,
             add_dirs=[self.workspace] if self.workspace else [],
-            cli_path=self.claude_bin or None,
+            cli_path=self._resolved_cli_path(),
             permission_mode="bypassPermissions",
             mcp_servers=self._sdk_mcp_servers(),
             include_partial_messages=self.progress_level in {"raw", "events"},
@@ -314,6 +397,9 @@ class ClaudeClient:
         )
 
     def ask_text(self, prompt: str, *, task_label: str | None = None) -> str:
+        missing_requirement = self._missing_runtime_requirement()
+        if missing_requirement:
+            raise ClaudeCallError(missing_requirement)
         try:
             return anyio.run(self._ask_text_async, prompt, task_label)
         except ClaudeCallError:
@@ -336,6 +422,7 @@ class ClaudeClient:
 
         self._last_tool_calls = []
         self._last_tool_uses = []
+        self._last_usage_summary = {}
 
         stderr_lines: list[str] = []
 
@@ -349,6 +436,11 @@ class ClaudeClient:
         text_chunks: list[str] = []
         tool_calls: list[str] = []
         tool_uses: list[dict[str, Any]] = []
+        usage_summary: dict[str, Any] = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
         final_result = ""
         first_text_logged = False
         tool_count = 0
@@ -515,6 +607,21 @@ class ClaudeClient:
                                         )
                                         first_text_logged = True
                         elif isinstance(message, StreamEvent):
+                            if isinstance(message.event, dict):
+                                msg_obj = message.event.get("message")
+                                if isinstance(msg_obj, dict):
+                                    usage = msg_obj.get("usage")
+                                    if isinstance(usage, dict):
+                                        for key in ("input_tokens", "output_tokens", "cache_read_input_tokens"):
+                                            value = usage.get(key)
+                                            if isinstance(value, (int, float)):
+                                                usage_summary[key] = max(int(value), int(usage_summary.get(key, 0) or 0))
+                                usage = message.event.get("usage")
+                                if isinstance(usage, dict):
+                                    for key in ("input_tokens", "output_tokens", "cache_read_input_tokens"):
+                                        value = usage.get(key)
+                                        if isinstance(value, (int, float)):
+                                            usage_summary[key] = max(int(value), int(usage_summary.get(key, 0) or 0))
                             raw_line = json.dumps(
                                 {
                                     "type": "stream_event",
@@ -591,6 +698,7 @@ class ClaudeClient:
 
         self._last_tool_calls = tool_calls
         self._last_tool_uses = tool_uses
+        self._last_usage_summary = usage_summary
         return out
 
     def get_last_tool_calls(self) -> list[str]:
@@ -598,6 +706,9 @@ class ClaudeClient:
 
     def get_last_tool_uses(self) -> list[dict[str, Any]]:
         return list(self._last_tool_uses)
+
+    def get_last_usage_summary(self) -> dict[str, Any]:
+        return dict(self._last_usage_summary)
 
     def ask_json(
         self,
@@ -621,25 +732,61 @@ class ClaudeClient:
             raw = self.ask_text(full_prompt, task_label=task_label)
             try:
                 data = extract_json_payload(raw)
-                if isinstance(data, dict):
-                    missing = [key for key in required_top_keys if key not in data]
-                    if missing:
-                        raise ClaudeCallError(f"缺少字段: {missing}")
+                self._validate_json_top_keys(data, required_top_keys)
                 return data
             except Exception as exc:  # noqa: BLE001
                 last_error = f"{type(exc).__name__}: {exc}"
+                try:
+                    data = self.repair_json_text(
+                        raw,
+                        required_top_keys=required_top_keys,
+                        parse_error=last_error,
+                        task_label=task_label,
+                    )
+                    return data
+                except Exception as repair_exc:  # noqa: BLE001
+                    last_error = f"{last_error}; repair_failed={type(repair_exc).__name__}: {repair_exc}"
         raise ClaudeCallError(f"JSON解析失败: {last_error}")
 
+    def repair_json_text(
+        self,
+        raw_text: str,
+        *,
+        required_top_keys: list[str] | None = None,
+        parse_error: str = "",
+        task_label: str | None = None,
+    ) -> dict[str, Any] | list[Any]:
+        required_top_keys = required_top_keys or []
+        required_keys_text = "、".join(required_top_keys) if required_top_keys else "无强制字段要求"
+        repair_prompt = (
+            "下面是一段本应为合法JSON的模型输出，但它当前不是严格合法的JSON。\n"
+            "请在不改变原始语义的前提下，将它修复成一个严格合法的JSON对象或JSON数组。\n"
+            "要求：\n"
+            "1. 只输出JSON，不要markdown，不要解释，不要前后缀。\n"
+            "2. 不要删减已有字段，除非该字段本身语法残缺到无法保留。\n"
+            f"3. 若输出为JSON对象，必须包含这些顶层字段：{required_keys_text}。\n"
+            "4. 保留中文内容与证据文本，不要擅自改写业务含义。\n\n"
+            f"[解析错误]\n{parse_error or '未提供'}\n\n"
+            "[待修复原文]\n"
+            f"{compact_text_for_prompt(raw_text, 16000)}"
+        )
+        repaired_raw = self.ask_text(
+            repair_prompt,
+            task_label=(f"{task_label}(JSON修复)" if task_label else "JSON修复"),
+        )
+        data = extract_json_payload(repaired_raw)
+        self._validate_json_top_keys(data, required_top_keys)
+        return data
+
+    @staticmethod
+    def _validate_json_top_keys(data: Any, required_top_keys: list[str]) -> None:
+        if isinstance(data, dict):
+            missing = [key for key in required_top_keys if key not in data]
+            if missing:
+                raise ClaudeCallError(f"缺少字段: {missing}")
+
     def available(self) -> bool:
-        try:
-            self._load_sdk()
-        except ClaudeCallError:
-            return False
-        if self.claude_bin:
-            return Path(self.claude_bin).expanduser().is_file()
-        if self._bundled_cli_path() is not None:
-            return True
-        return shutil.which("claude") is not None
+        return self._missing_runtime_requirement() is None
 
 
 def compact_text_for_prompt(text: str, max_chars: int) -> str:
