@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import is_dataclass, replace as dataclass_replace
 import json
 import re
 import os
@@ -24,7 +26,9 @@ from app.llm.claude_client import (
     extract_json_payload,
     prompt_safe_path,
 )
+from app.llm.opencode_client import OpenCodeClient
 from app.llm.prompt_store import render_prompt
+from app.mcp_servers.paddle_ocr_server import _batch_ocr_images
 from app.review.execution_policy import ReviewExecutionPolicy, normalize_review_profile
 from app.review.prepared_artifacts import (
     extract_or_load_word_image_manifest,
@@ -877,6 +881,179 @@ def _extract_review_scope(raw_data: dict[str, Any]) -> dict[str, Any]:
     return review_scope if isinstance(review_scope, dict) else {}
 
 
+def _collect_pages_seen_from_tool_uses(tool_uses: list[dict[str, Any]], *, target_path: Path) -> int:
+    max_page_seen = 0
+    target_norm = _canonical_path(target_path)
+    for call in tool_uses:
+        name = str(call.get("name", "")).lower()
+        if "read_pdf_pages" not in name and "read_pdf" not in name and "search_pdf_text" not in name:
+            continue
+        tool_input = call.get("input", {})
+        candidate_paths = _iter_path_candidates(tool_input)
+        if candidate_paths and target_norm not in {_canonical_path(path) for path in candidate_paths}:
+            continue
+        if "read_pdf_pages" in name and isinstance(tool_input, dict):
+            try:
+                max_page_seen = max(max_page_seen, int(tool_input.get("end_page", 0) or 0))
+            except Exception:
+                pass
+        elif "read_pdf" in name:
+            max_page_seen = max(max_page_seen, 999999)
+    return max_page_seen
+
+
+def _collect_bid_sections_seen_from_tool_uses(
+    tool_uses: list[dict[str, Any]],
+    *,
+    bid_path: Path,
+    bid_outline: dict[str, Any],
+) -> list[str]:
+    seen: list[str] = []
+    section_titles = [str(x) for x in bid_outline.get("sections", [])]
+    template_titles = [str(x) for x in bid_outline.get("template_sections", [])]
+    target_norm = _canonical_path(bid_path)
+
+    artifact_sections = []
+    if bid_path.exists():
+        try:
+            artifact_sections = list(load_or_build_bid_artifact(bid_path).data.get("sections", []))
+        except Exception:
+            artifact_sections = []
+    section_id_to_title = {
+        str(item.get("id", "")): str(item.get("title", "") or "")
+        for item in artifact_sections
+        if isinstance(item, dict)
+    }
+
+    for call in tool_uses:
+        name = str(call.get("name", "")).lower()
+        tool_input = call.get("input", {})
+        candidate_paths = _iter_path_candidates(tool_input)
+        if candidate_paths and target_norm not in {_canonical_path(path) for path in candidate_paths}:
+            continue
+        if "read_word_section" in name and isinstance(tool_input, dict):
+            raw_section_id = str(tool_input.get("section_id", "") or "").strip()
+            mapped = section_id_to_title.get(raw_section_id, "")
+            if mapped and mapped not in seen:
+                seen.append(mapped)
+            else:
+                for title in template_titles:
+                    if raw_section_id.lower() == title.lower() and title not in seen:
+                        seen.append(title)
+        if "search_word_text" in name and isinstance(tool_input, dict):
+            query = str(tool_input.get("query", "") or "")
+            lowered_query = query.lower()
+            for title in template_titles:
+                if title.lower() in lowered_query and title not in seen:
+                    seen.append(title)
+            for title in section_titles:
+                if title.lower() in lowered_query and title not in seen:
+                    seen.append(title)
+        if "read_word" in name:
+            for title in template_titles[:8]:
+                if title not in seen:
+                    seen.append(title)
+    return seen
+
+
+def _derive_observed_review_scope(
+    *,
+    tool_uses: list[dict[str, Any]],
+    tender_path: Path,
+    bid_path: Path,
+    tender_outline: dict[str, Any],
+    bid_outline: dict[str, Any],
+    ocr_required: bool,
+    require_word_extract: bool,
+    guard_state: dict[str, Any],
+) -> dict[str, Any]:
+    tender_total_pages = int(tender_outline.get("total_pages", 0) or 0)
+    pages_seen = _collect_pages_seen_from_tool_uses(tool_uses, target_path=tender_path)
+    if pages_seen >= 999999:
+        pages_seen = tender_total_pages
+    reviewed_sections: list[str] = []
+    if pages_seen > 0:
+        for item in tender_outline.get("sections", []):
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title", "") or "")
+            page_no = int(item.get("page_no", 0) or 0)
+            if title and page_no and page_no <= pages_seen and title not in reviewed_sections:
+                reviewed_sections.append(title)
+
+    bid_sections_reviewed = _collect_bid_sections_seen_from_tool_uses(
+        tool_uses,
+        bid_path=bid_path,
+        bid_outline=bid_outline,
+    )
+    image_count_seen = int(bid_outline.get("docx_image_count", 0) or 0) if bool(guard_state.get("word_ocr_coverage_ok", True)) else 0
+    ocr_completed = bool(guard_state.get("word_ocr_coverage_ok", True)) if (ocr_required and require_word_extract) else True
+    return {
+        "tender_total_pages_seen": pages_seen,
+        "tender_sections_reviewed": reviewed_sections,
+        "bid_sections_reviewed": bid_sections_reviewed,
+        "docx_image_count_seen": image_count_seen,
+        "docx_ocr_completed": ocr_completed,
+    }
+
+
+def _merge_review_scope_with_observed(raw_data: dict[str, Any], observed_scope: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(raw_data, dict):
+        return raw_data
+    summary = raw_data.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+        raw_data["summary"] = summary
+    review_scope = summary.get("review_scope")
+    if not isinstance(review_scope, dict):
+        review_scope = {}
+        summary["review_scope"] = review_scope
+
+    review_scope["tender_total_pages_seen"] = max(
+        int(review_scope.get("tender_total_pages_seen", 0) or 0),
+        int(observed_scope.get("tender_total_pages_seen", 0) or 0),
+    )
+    for key in ("tender_sections_reviewed", "bid_sections_reviewed"):
+        merged: list[str] = []
+        for value in list(review_scope.get(key, [])) + list(observed_scope.get(key, [])):
+            text = _clean_text(str(value or ""))
+            if text and text not in merged:
+                merged.append(text)
+        review_scope[key] = merged
+    review_scope["docx_image_count_seen"] = max(
+        int(review_scope.get("docx_image_count_seen", 0) or 0),
+        int(observed_scope.get("docx_image_count_seen", 0) or 0),
+    )
+    review_scope["docx_ocr_completed"] = bool(review_scope.get("docx_ocr_completed", False)) or bool(
+        observed_scope.get("docx_ocr_completed", False)
+    )
+    return raw_data
+
+
+def _apply_observed_scope_to_report(report: dict[str, Any], observed_scope: dict[str, Any]) -> dict[str, Any]:
+    summary = report.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+        report["summary"] = summary
+    review_scope = summary.get("review_scope")
+    if not isinstance(review_scope, dict):
+        review_scope = {}
+        summary["review_scope"] = review_scope
+    for key, value in observed_scope.items():
+        if key in {"tender_total_pages_seen", "docx_image_count_seen"}:
+            review_scope[key] = max(int(review_scope.get(key, 0) or 0), int(value or 0))
+        elif key in {"docx_ocr_completed"}:
+            review_scope[key] = bool(review_scope.get(key, False)) or bool(value)
+        elif key in {"tender_sections_reviewed", "bid_sections_reviewed"}:
+            merged: list[str] = []
+            for item in list(review_scope.get(key, [])) + list(value or []):
+                text = _clean_text(str(item or ""))
+                if text and text not in merged:
+                    merged.append(text)
+            review_scope[key] = merged
+    return report
+
+
 def _normalize_scope_section_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -925,9 +1102,6 @@ def _evaluate_review_completion(
     if not review_scope:
         reasons.append("缺少 review_scope，无法证明已完成全文结构盘点和全文阅读。")
         return reasons
-
-    if not bool(review_scope.get("completion_check_passed", False)):
-        reasons.append("review_scope.completion_check_passed 不是 true。")
 
     tender_total_pages = int(tender_outline.get("total_pages", 0) or 0)
     tender_pages_seen = int(review_scope.get("tender_total_pages_seen", 0) or 0)
@@ -1303,6 +1477,114 @@ def _estimate_ocr_cache_metrics(
     }
 
 
+_OCR_PROMPT_PRIORITY_KEYWORDS = (
+    "营业执照",
+    "统一社会信用代码",
+    "税号",
+    "纳税人识别号",
+    "社保",
+    "社会保险",
+    "开户银行",
+    "账户名",
+    "账号",
+    "基本存款账户",
+    "法定代表人",
+    "授权委托书",
+    "项目负责人",
+)
+
+
+def _build_stage_ocr_prompt_note(preprocessed_ocr: dict[str, Any] | None) -> str:
+    if not preprocessed_ocr:
+        return "无"
+    if not bool(preprocessed_ocr.get("enabled", False)):
+        return "无"
+    lines = [
+        "本次运行中，编排层已预先完成 docx 图片处理。你必须复用这份预处理结果，禁止再次调用 `document-parser.extract_images_from_word` 或 `paddle-ocr.ocr_images_in_dir`。",
+        f"- 提图目录（受控临时目录）: {preprocessed_ocr.get('output_dir', '')}",
+        f"- 图片数量: {int(preprocessed_ocr.get('image_count', 0) or 0)}",
+        f"- 全量OCR完成: {'true' if bool(preprocessed_ocr.get('completed', False)) else 'false'}",
+    ]
+    summary = preprocessed_ocr.get("summary", {})
+    if isinstance(summary, dict):
+        lines.append(
+            "- OCR摘要: "
+            + f"succeeded={int(summary.get('succeeded', 0) or 0)}, "
+            + f"failed={int(summary.get('failed', 0) or 0)}"
+        )
+    preview_lines = list(preprocessed_ocr.get("preview_lines", []))
+    if preview_lines:
+        lines.append("- OCR关键命中预览：")
+        lines.extend(preview_lines[:12])
+    lines.append(
+        "- 若确需核对单张图片，只允许对上述受控临时目录中的具体图片路径调用 `paddle-ocr.ocr_image`；禁止再次执行全量提图或批量OCR。"
+    )
+    return "\n".join(lines)
+
+
+def _preprocess_docx_ocr_for_stages(
+    *,
+    image_manifest: dict[str, Any] | None,
+    policy: ReviewExecutionPolicy,
+) -> dict[str, Any] | None:
+    if not image_manifest:
+        return None
+    image_paths = [Path(str(x)).resolve() for x in image_manifest.get("image_paths", []) if str(x or "").strip()]
+    if not image_paths:
+        return {
+            "enabled": True,
+            "completed": True,
+            "image_count": 0,
+            "output_dir": str(image_manifest.get("output_dir", "")),
+            "summary": {"total_files": 0, "succeeded": 0, "failed": 0},
+            "metrics": {"chunk_size": policy.ocr_concurrency.chunk_size, "max_inflight_chunks": 0},
+            "preview_lines": [],
+            "duration_ms": 0,
+        }
+    started = time.perf_counter()
+    payload = _batch_ocr_images(
+        image_paths,
+        chunk_size=policy.ocr_concurrency.chunk_size,
+        language="ch",
+    )
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    preview_lines: list[str] = []
+    seen_paths: set[str] = set()
+    fallback_lines: list[str] = []
+    for item in payload.get("results", []):
+        if not isinstance(item, dict):
+            continue
+        source_path = str(item.get("source_path", "") or "").strip()
+        if not source_path or source_path in seen_paths:
+            continue
+        text = _clean_text(str(item.get("text", "") or ""))
+        if not text:
+            continue
+        preview = compact_text_for_prompt(text, 180).replace("\n", " ")
+        line = f"  - {source_path}: {preview}"
+        if any(keyword in text for keyword in _OCR_PROMPT_PRIORITY_KEYWORDS):
+            preview_lines.append(line)
+            seen_paths.add(source_path)
+            continue
+        if len(fallback_lines) < 3:
+            fallback_lines.append(line)
+            seen_paths.add(source_path)
+    if len(preview_lines) < 12:
+        preview_lines.extend(fallback_lines[: max(0, 12 - len(preview_lines))])
+    summary = payload.get("summary", {})
+    failed_count = int(summary.get("failed", 0) or 0) if isinstance(summary, dict) else 0
+    return {
+        "enabled": True,
+        "completed": failed_count == 0,
+        "image_count": len(image_paths),
+        "output_dir": str(image_manifest.get("output_dir", "")),
+        "summary": summary if isinstance(summary, dict) else {},
+        "metrics": payload.get("metrics", {}) if isinstance(payload.get("metrics", {}), dict) else {},
+        "preview_lines": preview_lines[:12],
+        "duration_ms": duration_ms,
+    }
+
+
 def _record_last_review_metrics(client: Any, metrics: dict[str, Any]) -> None:
     try:
         setattr(client, "_last_review_metrics", dict(metrics))
@@ -1573,6 +1855,44 @@ def _is_context_consistency_finding(finding: dict[str, Any]) -> bool:
         )
     )
     return any(k in text for k in _CONTEXT_FINDING_KEYWORDS)
+
+
+_STAGE_CONTEXT_KEYWORD_GROUPS = [
+    ("角色", "错位"),
+    ("主体", "错位"),
+    ("主体", "不一致"),
+    ("字段", "冲突"),
+    ("收件人",),
+    ("抬头",),
+    ("招标人名称",),
+    ("招标代理机构名称",),
+    ("投标人身份",),
+    ("落款",),
+    ("致：",),
+]
+
+_STAGE_SEMANTIC_KEYWORD_GROUPS = [
+    ("字段标签", "值类型", "不匹配"),
+    ("应填语义类型", "实际值", "实际类型"),
+    ("语义类型", "不匹配"),
+    ("类型", "不匹配"),
+]
+
+
+def _is_context_stage_finding(finding: dict[str, Any]) -> bool:
+    merged_text = " ".join(
+        str(finding.get(k, "") or "")
+        for k in ("issue", "tender_evidence", "bid_evidence", "recommendation")
+    )
+    return _match_text_by_keyword_groups(merged_text, _STAGE_CONTEXT_KEYWORD_GROUPS)
+
+
+def _is_semantic_stage_finding(finding: dict[str, Any]) -> bool:
+    merged_text = " ".join(
+        str(finding.get(k, "") or "")
+        for k in ("issue", "tender_evidence", "bid_evidence", "recommendation")
+    )
+    return _match_text_by_keyword_groups(merged_text, _STAGE_SEMANTIC_KEYWORD_GROUPS)
 
 
 def _bind_findings_to_context_requirement(
@@ -3082,7 +3402,7 @@ def detect_tender_and_bids_with_claude(
     return str(Path(tender_path).resolve()), bid_paths, reasoning
 
 
-def run_bid_review_with_claude(
+def _run_bid_review_single_session(
     *,
     tender_path: str,
     bid_path: str,
@@ -3248,8 +3568,20 @@ def run_bid_review_with_claude(
                 tender_path=tender_path_obj,
                 bid_path=bid_path_obj,
             )
+            observed_scope = _derive_observed_review_scope(
+                tool_uses=client.get_last_tool_uses(),
+                tender_path=tender_path_obj,
+                bid_path=bid_path_obj,
+                tender_outline=tender_outline,
+                bid_outline=bid_outline,
+                ocr_required=ocr_required,
+                require_word_extract=require_word_extract,
+                guard_state=active_guard,
+            )
+            report = _apply_observed_scope_to_report(report, observed_scope)
             if policy.enable_completion_retry and _completion_gate_enabled():
                 raw_data = extract_json_payload(raw_output)
+                raw_data = _merge_review_scope_with_observed(raw_data, observed_scope)
                 completion_failures = _evaluate_review_completion(
                     raw_data,
                     tender_outline=tender_outline,
@@ -3279,7 +3611,26 @@ def run_bid_review_with_claude(
                         tender_path=tender_path_obj,
                         bid_path=bid_path_obj,
                     )
+                    retry_guard_state = _collect_review_guard_state(
+                        tool_calls=client.get_last_tool_calls(),
+                        tool_uses=client.get_last_tool_uses(),
+                        ocr_required=ocr_required,
+                        require_word_extract=require_word_extract,
+                        bid_path=bid_path_obj,
+                    )
+                    observed_scope = _derive_observed_review_scope(
+                        tool_uses=client.get_last_tool_uses(),
+                        tender_path=tender_path_obj,
+                        bid_path=bid_path_obj,
+                        tender_outline=tender_outline,
+                        bid_outline=bid_outline,
+                        ocr_required=ocr_required,
+                        require_word_extract=require_word_extract,
+                        guard_state=retry_guard_state,
+                    )
+                    report = _apply_observed_scope_to_report(report, observed_scope)
                     raw_data = extract_json_payload(completion_retry_raw)
+                    raw_data = _merge_review_scope_with_observed(raw_data, observed_scope)
                     retry_completion_failures = _evaluate_review_completion(
                         raw_data,
                         tender_outline=tender_outline,
@@ -3423,3 +3774,810 @@ def run_bid_review_with_claude(
     metrics["json_repair_count"] = merged_raw.count("[JSON_REPAIRED]")
     _record_last_review_metrics(client, metrics)
     return report, merged_raw
+
+
+def _staged_review_enabled() -> bool:
+    return os.getenv("BID_REVIEW_ENABLE_STAGED_PARALLEL_REVIEW", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _supports_staged_parallel_review(client: Any) -> bool:
+    if not _staged_review_enabled():
+        return False
+    if callable(getattr(client, "clone_for_parallel_review", None)):
+        return True
+    return isinstance(client, (ClaudeClient, OpenCodeClient)) or is_dataclass(client)
+
+
+def _clone_review_client(client: Any, *, stage_name: str) -> Any:
+    clone_fn = getattr(client, "clone_for_parallel_review", None)
+    if callable(clone_fn):
+        clone = clone_fn(stage_name=stage_name)
+        if clone is None:
+            raise ClaudeCallError(f"无法为阶段 `{stage_name}` 创建独立客户端实例。")
+        return clone
+    if isinstance(client, (ClaudeClient, OpenCodeClient)) or is_dataclass(client):
+        try:
+            return dataclass_replace(client)
+        except Exception as exc:  # noqa: BLE001
+            raise ClaudeCallError(f"复制阶段 `{stage_name}` 的客户端实例失败：{exc}") from exc
+    raise ClaudeCallError(f"当前客户端不支持阶段 `{stage_name}` 的独立会话复制。")
+
+
+def _parse_stage_json_output(
+    *,
+    raw_output: str,
+    prompt: str,
+    client: Any,
+    required_top_keys: list[str],
+    task_label: str,
+) -> tuple[dict[str, Any], str]:
+    try:
+        data = extract_json_payload(raw_output)
+    except Exception as exc:  # noqa: BLE001
+        repaired = None
+        if hasattr(client, "repair_json_text"):
+            try:
+                repaired = client.repair_json_text(
+                    raw_output,
+                    required_top_keys=required_top_keys,
+                    parse_error=f"{type(exc).__name__}: {exc}",
+                    task_label=f"{task_label}(JSON修复)",
+                )
+            except Exception:  # noqa: BLE001
+                repaired = None
+        if repaired is not None:
+            data = repaired
+            raw_output = (
+                f"{raw_output}\n\n[JSON_REPAIRED]\n"
+                + json.dumps(data, ensure_ascii=False, indent=2)
+            )
+        else:
+            data = client.ask_json(
+                prompt,
+                required_top_keys=required_top_keys,
+                task_label=f"{task_label}(JSON重试)",
+            )
+            raw_output = (
+                f"{raw_output}\n\n[JSON_FALLBACK]\n"
+                + json.dumps(data, ensure_ascii=False, indent=2)
+            )
+    if not isinstance(data, dict):
+        raise ValueError(f"{task_label} 返回的结果不是 JSON 对象。")
+    missing = [key for key in required_top_keys if key not in data]
+    if missing:
+        raise ValueError(f"{task_label} 返回缺少关键字段: {missing}")
+    return data, raw_output
+
+
+def _ask_stage_text_with_empty_output_retry(
+    client: Any,
+    prompt: str,
+    *,
+    task_label: str,
+    required_top_keys: list[str],
+) -> tuple[str, int]:
+    attempts = 1
+    try:
+        return client.ask_text(prompt, task_label=task_label), attempts
+    except ClaudeCallError as exc:
+        if "返回空输出" not in str(exc):
+            raise
+        attempts += 1
+        fallback_keys = "、".join(required_top_keys)
+        retry_prompt = (
+            prompt
+            + "\n上一轮返回空输出。即使没有任何发现，也必须输出一个严格合法的 JSON 对象。"
+            + f"顶层必须包含字段：{fallback_keys}。"
+            + "如果没有内容，返回空数组和最小 summary，不要留空，不要省略字段。"
+        )
+        return client.ask_text(retry_prompt, task_label=f"{task_label}(空输出重试)"), attempts
+
+
+def _run_json_review_stage(
+    *,
+    stage_name: str,
+    client: Any,
+    prompt: str,
+    task_label: str,
+    required_top_keys: list[str],
+    tender_path: Path,
+    bid_path: Path,
+    tender_outline: dict[str, Any],
+    bid_outline: dict[str, Any],
+    ocr_required: bool,
+    require_word_extract: bool,
+    forbid_repeated_word_batch_ocr: bool = False,
+) -> dict[str, Any]:
+    original_timeout = getattr(client, "timeout_sec", 240)
+    started = time.perf_counter()
+    attempt_count = 0
+    stage_prompt = prompt
+    if ocr_required and require_word_extract and getattr(client, "timeout_sec", 0) < 7200:
+        client.timeout_sec = 7200
+    try:
+        with _prefer_claude_sdk_review_tools(client):
+            stage_prompt = _append_no_write_enforcement(stage_prompt)
+            raw_output, ask_attempts = _ask_stage_text_with_empty_output_retry(
+                client,
+                stage_prompt,
+                task_label=task_label,
+                required_top_keys=required_top_keys,
+            )
+            attempt_count += ask_attempts
+            first_guard = _collect_review_guard_state(
+                tool_calls=client.get_last_tool_calls(),
+                tool_uses=client.get_last_tool_uses(),
+                ocr_required=ocr_required,
+                require_word_extract=require_word_extract,
+                bid_path=bid_path,
+            )
+            repeated_word_batch_ocr = forbid_repeated_word_batch_ocr and (
+                _has_word_image_extract_call(client.get_last_tool_calls())
+                or _has_word_batch_ocr_call(client.get_last_tool_calls())
+            )
+            need_retry = bool(first_guard.get("has_forbidden_write", False)) or not bool(
+                first_guard.get("ocr_guard_ok", True)
+            ) or repeated_word_batch_ocr
+            if need_retry:
+                attempt_count += 1
+                retry_prompt = stage_prompt
+                if not bool(first_guard.get("ocr_guard_ok", True)):
+                    retry_prompt = _append_ocr_enforcement(
+                        retry_prompt,
+                        require_word_extract=require_word_extract,
+                    )
+                if require_word_extract and not bool(first_guard.get("word_ocr_coverage_ok", True)):
+                    retry_prompt = (
+                        retry_prompt
+                        + "\n你上一次未完成 Word 提图全量 OCR。"
+                        + str(first_guard.get("word_ocr_coverage_detail", ""))
+                        + "请严格覆盖提图目录中的全部图片。"
+                    )
+                if bool(first_guard.get("has_forbidden_write", False)):
+                    retry_prompt = _append_no_write_enforcement(retry_prompt)
+                if repeated_word_batch_ocr:
+                    retry_prompt += (
+                        "\n运行时编排层已预先完成 Word 提图和批量 OCR。"
+                        "禁止再次调用 `document-parser.extract_images_from_word` 或 `paddle-ocr.ocr_images_in_dir`。"
+                        "如确需核对单张图片，只允许对受控临时目录中的具体图片调用 `paddle-ocr.ocr_image`。"
+                    )
+                retry_output, retry_attempts = _ask_stage_text_with_empty_output_retry(
+                    client,
+                    retry_prompt,
+                    task_label=f"{task_label}(约束强制重试)",
+                    required_top_keys=required_top_keys,
+                )
+                attempt_count += max(0, retry_attempts - 1)
+                retry_guard = _collect_review_guard_state(
+                    tool_calls=client.get_last_tool_calls(),
+                    tool_uses=client.get_last_tool_uses(),
+                    ocr_required=ocr_required,
+                    require_word_extract=require_word_extract,
+                    bid_path=bid_path,
+                )
+                repeated_word_batch_ocr = forbid_repeated_word_batch_ocr and (
+                    _has_word_image_extract_call(client.get_last_tool_calls())
+                    or _has_word_batch_ocr_call(client.get_last_tool_calls())
+                )
+                missing_requirements = [str(x) for x in retry_guard.get("missing_requirements", [])]
+                if missing_requirements:
+                    raise ClaudeCallError(
+                        f"{stage_name} 缺少必要MCP调用（{', '.join(missing_requirements)}），已按强制规则重试1次仍失败。"
+                    )
+                if repeated_word_batch_ocr:
+                    raise ClaudeCallError(
+                        f"{stage_name} 仍重复调用 Word 提图或批量 OCR，未复用编排层的预处理结果。"
+                    )
+                if require_word_extract and not bool(retry_guard.get("word_ocr_coverage_ok", True)):
+                    raise ClaudeCallError(
+                        f"{stage_name} 的 Word 图片OCR未全量覆盖，已按强制规则重试1次仍失败。"
+                        + str(retry_guard.get("word_ocr_coverage_detail", ""))
+                    )
+                if bool(retry_guard.get("has_forbidden_write", False)) and _strict_fail_on_forbidden_write():
+                    raise ClaudeCallError(f"{stage_name} 检测到写文件/脚本执行行为，已按只读规则重试1次仍失败。")
+                raw_output = retry_output
+                active_guard = retry_guard
+                stage_prompt = retry_prompt
+            else:
+                active_guard = first_guard
+
+            if require_word_extract and not bool(active_guard.get("word_ocr_coverage_ok", True)):
+                raise ClaudeCallError(
+                    f"{stage_name} 的 Word 图片OCR未全量覆盖。"
+                    + str(active_guard.get("word_ocr_coverage_detail", ""))
+                )
+
+            data, raw_output = _parse_stage_json_output(
+                raw_output=raw_output,
+                prompt=stage_prompt,
+                client=client,
+                required_top_keys=required_top_keys,
+                task_label=task_label,
+            )
+    finally:
+        client.timeout_sec = original_timeout
+
+    observed_scope = _derive_observed_review_scope(
+        tool_uses=client.get_last_tool_uses(),
+        tender_path=tender_path,
+        bid_path=bid_path,
+        tender_outline=tender_outline,
+        bid_outline=bid_outline,
+        ocr_required=ocr_required,
+        require_word_extract=require_word_extract,
+        guard_state=active_guard,
+    )
+    return {
+        "stage_name": stage_name,
+        "data": data,
+        "raw_output": raw_output,
+        "tool_calls": client.get_last_tool_calls(),
+        "tool_uses": client.get_last_tool_uses(),
+        "usage_summary": getattr(client, "get_last_usage_summary", lambda: {})(),
+        "guard_state": active_guard,
+        "observed_scope": observed_scope,
+        "attempt_count": attempt_count,
+        "duration_ms": int((time.perf_counter() - started) * 1000),
+    }
+
+
+def _append_requirements_completion_enforcement(
+    prompt: str,
+    *,
+    tender_document_map: str,
+    min_requirement_count: int,
+    reasons: list[str],
+) -> str:
+    reason_block = "\n".join(f"- {item}" for item in reasons[:8])
+    return f"""
+你正在修复上一轮 requirements 提取结果不足的问题。不要输出 findings，只补足 requirements 并返回完整 JSON。
+
+未通过原因：
+{reason_block}
+
+要求：
+1. 继续阅读招标文件缺失部分，优先覆盖第二章“投标人须知”、技术要求章节、第六章“投标文件格式”。
+2. 最终 `requirements` 数量不得少于 {min_requirement_count} 条，除非你已经读完整份招标文件且文档本身显著少于该数量。
+3. 必须覆盖资格、业绩、报价、工期、签章、格式、技术、服务，以及第六章模板字段类 requirements。
+4. 不要输出任何 findings。
+5. 在 `summary.review_scope` 中如实返回：
+   - `tender_total_pages_seen`
+   - `tender_sections_reviewed`
+   - `completion_check_passed`
+
+[招标文件结构地图]
+{tender_document_map}
+
+[原任务上下文摘要]
+{compact_text_for_prompt(prompt, 2400)}
+"""
+
+
+def _normalize_stage_findings_against_requirements(
+    stage_name: str,
+    data: dict[str, Any],
+    *,
+    requirements: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    findings = _normalize_findings(data.get("findings", []))
+    filtered: list[dict[str, Any]] = []
+    for item in findings:
+        current = dict(item)
+        is_context = _is_context_stage_finding(current)
+        is_semantic = _is_semantic_stage_finding(current)
+        if stage_name == "compliance":
+            if is_context or is_semantic:
+                continue
+        elif stage_name == "context":
+            if not is_context or is_semantic:
+                continue
+        elif stage_name == "semantic":
+            if not is_semantic:
+                continue
+        filtered.append(current)
+    findings = filtered
+    valid_req_ids = {str(item.get("id", "")).strip() for item in requirements if str(item.get("id", "")).strip()}
+    context_req_id = _find_context_requirement_id(requirements)
+    fallback_req_id = _pick_requirement_id({"requirements": requirements}, [context_req_id])
+
+    rebound: list[dict[str, Any]] = []
+    for item in findings:
+        current = dict(item)
+        rid = str(current.get("requirement_id", "")).strip()
+        if rid and rid not in valid_req_ids:
+            current["requirement_id"] = ""
+        rebound.append(current)
+
+    rebound = _bind_findings_to_context_requirement(
+        rebound,
+        valid_req_ids=valid_req_ids,
+        context_req_id=context_req_id,
+    )
+    out: list[dict[str, Any]] = []
+    for item in rebound:
+        current = dict(item)
+        rid = str(current.get("requirement_id", "")).strip()
+        if rid not in valid_req_ids and fallback_req_id:
+            current["requirement_id"] = fallback_req_id
+        out.append(current)
+    return out
+
+
+def _merge_observed_scopes(scopes: list[dict[str, Any]]) -> dict[str, Any]:
+    merged = {
+        "tender_total_pages_seen": 0,
+        "tender_sections_reviewed": [],
+        "bid_sections_reviewed": [],
+        "docx_image_count_seen": 0,
+        "docx_ocr_completed": False,
+    }
+    for scope in scopes:
+        if not isinstance(scope, dict):
+            continue
+        merged["tender_total_pages_seen"] = max(
+            int(merged.get("tender_total_pages_seen", 0) or 0),
+            int(scope.get("tender_total_pages_seen", 0) or 0),
+        )
+        merged["docx_image_count_seen"] = max(
+            int(merged.get("docx_image_count_seen", 0) or 0),
+            int(scope.get("docx_image_count_seen", 0) or 0),
+        )
+        merged["docx_ocr_completed"] = bool(merged.get("docx_ocr_completed", False)) or bool(
+            scope.get("docx_ocr_completed", False)
+        )
+        for key in ("tender_sections_reviewed", "bid_sections_reviewed"):
+            bucket = list(merged.get(key, []))
+            for item in list(scope.get(key, [])):
+                text = _clean_text(str(item or ""))
+                if text and text not in bucket:
+                    bucket.append(text)
+            merged[key] = bucket
+    return merged
+
+
+def _run_bid_review_staged(
+    *,
+    tender_path: str,
+    bid_path: str,
+    client: Any,
+    extra_instruction: str = "",
+    user_instruction: str = "",
+    review_profile: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    backend_name = "OpenCode" if client.__class__.__name__.lower().startswith("opencode") else "Claude"
+    tender_path_obj = Path(tender_path).resolve()
+    bid_path_obj = Path(bid_path).resolve()
+    policy = ReviewExecutionPolicy.for_profile(
+        normalize_review_profile(review_profile or os.getenv("BID_REVIEW_REVIEW_PROFILE", "thorough"))
+    )
+    prepare_started = time.perf_counter()
+    try:
+        if tender_path_obj.exists():
+            tender_prepared = load_or_build_tender_artifact(tender_path_obj)
+        else:
+            raise FileNotFoundError
+    except Exception:  # noqa: BLE001
+        tender_prepared = type("Prepared", (), {"data": {"file_hash": ""}, "cache_hit": False})()
+    try:
+        if bid_path_obj.exists():
+            bid_prepared = load_or_build_bid_artifact(bid_path_obj)
+        else:
+            raise FileNotFoundError
+    except Exception:  # noqa: BLE001
+        bid_prepared = type("Prepared", (), {"data": {"file_hash": ""}, "cache_hit": False})()
+    image_manifest_prepared: dict[str, Any] | None = None
+    if bid_path_obj.suffix.lower() == ".docx" and bid_path_obj.exists():
+        try:
+            image_manifest_prepared = extract_or_load_word_image_manifest(
+                bid_path_obj,
+                filter_policy=policy.ocr_filter_policy,
+            ).data
+        except Exception:  # noqa: BLE001
+            image_manifest_prepared = None
+    prepare_duration_ms = int((time.perf_counter() - prepare_started) * 1000)
+
+    workspace_dir = prompt_safe_path(str(tender_path_obj.parent))
+    tender_stem = tender_path_obj.stem
+    bid_stem = bid_path_obj.stem
+    tender_outline = _collect_tender_outline(tender_path_obj)
+    bid_outline = _collect_bid_outline(bid_path_obj)
+    min_requirement_count = _estimate_min_requirement_count(
+        tender_outline=tender_outline,
+        bid_outline=bid_outline,
+    )
+    tender_document_map = compact_text_for_prompt(
+        _format_tender_outline_for_prompt(tender_outline),
+        3000,
+    )
+    bid_document_map = compact_text_for_prompt(
+        _format_bid_outline_for_prompt(bid_outline, bid_path=bid_path_obj),
+        4000,
+    )
+    instruction = compact_text_for_prompt(extra_instruction.strip(), 2000) if extra_instruction else "无"
+    user_ins = compact_text_for_prompt(user_instruction.strip(), 2000) if user_instruction else "无"
+    require_word_extract = bid_path_obj.suffix.lower() == ".docx"
+    ocr_required = _instruction_requires_ocr(user_instruction, extra_instruction) or (
+        require_word_extract and _docx_ocr_required_by_default()
+    )
+    preprocessed_ocr: dict[str, Any] | None = None
+    if require_word_extract and ocr_required:
+        preprocessed_ocr = _preprocess_docx_ocr_for_stages(
+            image_manifest=image_manifest_prepared,
+            policy=policy,
+        )
+    preprocessed_ocr_note = _build_stage_ocr_prompt_note(preprocessed_ocr)
+
+    metrics: dict[str, Any] = {
+        "review_profile": policy.review_profile,
+        "prepare": {
+            "duration_ms": prepare_duration_ms,
+            "tender_file_hash": tender_prepared.data.get("file_hash", ""),
+            "bid_file_hash": bid_prepared.data.get("file_hash", ""),
+        },
+        "pdf_cache_hit": bool(tender_prepared.cache_hit),
+        "word_cache_hit": bool(bid_prepared.cache_hit) if require_word_extract else False,
+        "initial_review_duration_ms": 0,
+        "review_attempt_count": 0,
+        "json_repair_count": 0,
+        "completion_retry_count": 0,
+        "location_retry_count": 0,
+        "second_pass_used": False,
+        "tool_usage_summary": {},
+        "token_usage_summary": {},
+        "stage_mode": "requirements+parallel-findings",
+    }
+    metrics.update(_estimate_ocr_cache_metrics(image_manifest_prepared, policy=policy))
+    if preprocessed_ocr:
+        metrics["ocr_preprocess"] = {
+            "completed": bool(preprocessed_ocr.get("completed", False)),
+            "image_count": int(preprocessed_ocr.get("image_count", 0) or 0),
+            "duration_ms": int(preprocessed_ocr.get("duration_ms", 0) or 0),
+            "output_dir": str(preprocessed_ocr.get("output_dir", "") or ""),
+            "summary": dict(preprocessed_ocr.get("summary", {})) if isinstance(preprocessed_ocr.get("summary", {}), dict) else {},
+            "metrics": dict(preprocessed_ocr.get("metrics", {})) if isinstance(preprocessed_ocr.get("metrics", {}), dict) else {},
+        }
+    initial_review_started = time.perf_counter()
+
+    requirements_prompt = render_prompt(
+        "review_requirements.md",
+        workspace_dir=workspace_dir,
+        tender_stem=tender_stem,
+        tender_path=str(tender_path_obj),
+        user_instruction=user_ins,
+        instruction=instruction,
+        tender_document_map=tender_document_map,
+        minimum_requirement_count=str(min_requirement_count),
+    )
+    requirements_stage = _run_json_review_stage(
+        stage_name="requirements",
+        client=client,
+        prompt=requirements_prompt,
+        task_label=f"条款提取：{bid_path_obj.name}",
+        required_top_keys=["requirements", "summary"],
+        tender_path=tender_path_obj,
+        bid_path=bid_path_obj,
+        tender_outline=tender_outline,
+        bid_outline=bid_outline,
+        ocr_required=False,
+        require_word_extract=False,
+    )
+    metrics["review_attempt_count"] += int(requirements_stage.get("attempt_count", 1) or 1)
+    metrics["initial_review_duration_ms"] = int(metrics.get("initial_review_duration_ms", 0) or 0)
+
+    requirements_report = normalize_review_report(
+        {
+            "requirements": requirements_stage["data"].get("requirements", []),
+            "findings": [],
+            "summary": requirements_stage["data"].get("summary", {}),
+        }
+    )
+    requirements_report = _apply_observed_scope_to_report(
+        requirements_report,
+        requirements_stage.get("observed_scope", {}),
+    )
+    requirements_report = _ensure_context_consistency_requirement(requirements_report)
+    requirements_report = _ensure_template_field_requirements(
+        requirements_report,
+        tender_path=tender_path_obj,
+    )
+    _refresh_summary(requirements_report)
+
+    if len(requirements_report.get("requirements", [])) < min_requirement_count:
+        retry_prompt = _append_requirements_completion_enforcement(
+            requirements_prompt,
+            tender_document_map=tender_document_map,
+            min_requirement_count=min_requirement_count,
+            reasons=[
+                f"硬性要求仅提取到 {len(requirements_report.get('requirements', []))} 条，低于完成门槛 {min_requirement_count} 条。"
+            ],
+        )
+        requirements_retry = _run_json_review_stage(
+            stage_name="requirements-retry",
+            client=client,
+            prompt=retry_prompt,
+            task_label=f"条款提取重试：{bid_path_obj.name}",
+            required_top_keys=["requirements", "summary"],
+            tender_path=tender_path_obj,
+            bid_path=bid_path_obj,
+            tender_outline=tender_outline,
+            bid_outline=bid_outline,
+            ocr_required=False,
+            require_word_extract=False,
+        )
+        metrics["completion_retry_count"] = 1
+        metrics["review_attempt_count"] += int(requirements_retry.get("attempt_count", 1) or 1)
+        requirements_stage = requirements_retry
+        requirements_report = normalize_review_report(
+            {
+                "requirements": requirements_stage["data"].get("requirements", []),
+                "findings": [],
+                "summary": requirements_stage["data"].get("summary", {}),
+            }
+        )
+        requirements_report = _apply_observed_scope_to_report(
+            requirements_report,
+            requirements_stage.get("observed_scope", {}),
+        )
+        requirements_report = _ensure_context_consistency_requirement(requirements_report)
+        requirements_report = _ensure_template_field_requirements(
+            requirements_report,
+            tender_path=tender_path_obj,
+        )
+        _refresh_summary(requirements_report)
+
+    requirements = list(requirements_report.get("requirements", []))
+    requirements_json = compact_text_for_prompt(
+        json.dumps(requirements, ensure_ascii=False, indent=2),
+        12000,
+    )
+
+    stage_specs = [
+        {
+            "stage_name": "compliance",
+            "task_label": f"逐条审查：{bid_path_obj.name}",
+            "prompt_name": "review_findings_main.md",
+        },
+        {
+            "stage_name": "context",
+            "task_label": f"上下文一致性校验：{bid_path_obj.name}",
+            "prompt_name": "review_findings_context.md",
+        },
+        {
+            "stage_name": "semantic",
+            "task_label": f"字段语义类型校验：{bid_path_obj.name}",
+            "prompt_name": "review_findings_semantic.md",
+        },
+    ]
+
+    def _run_parallel_stage(spec: dict[str, str]) -> dict[str, Any]:
+        stage_client = _clone_review_client(client, stage_name=spec["stage_name"])
+        stage_prompt = render_prompt(
+            spec["prompt_name"],
+            workspace_dir=workspace_dir,
+            tender_stem=tender_stem,
+            bid_stem=bid_stem,
+            tender_path=str(tender_path_obj),
+            bid_path=str(bid_path_obj),
+            user_instruction=user_ins,
+            instruction=instruction,
+            tender_document_map=tender_document_map,
+            bid_document_map=bid_document_map,
+            requirements_json=requirements_json,
+            preprocessed_ocr_note=preprocessed_ocr_note,
+        )
+        stage_result = _run_json_review_stage(
+            stage_name=spec["stage_name"],
+            client=stage_client,
+            prompt=stage_prompt,
+            task_label=spec["task_label"],
+            required_top_keys=["findings", "summary"],
+            tender_path=tender_path_obj,
+            bid_path=bid_path_obj,
+            tender_outline=tender_outline,
+            bid_outline=bid_outline,
+            ocr_required=False if preprocessed_ocr else ocr_required,
+            require_word_extract=require_word_extract,
+            forbid_repeated_word_batch_ocr=bool(preprocessed_ocr),
+        )
+        stage_result["task_label"] = spec["task_label"]
+        stage_result["prompt_name"] = spec["prompt_name"]
+        return stage_result
+
+    parallel_results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=len(stage_specs)) as executor:
+        futures = [executor.submit(_run_parallel_stage, spec) for spec in stage_specs]
+        for future in futures:
+            parallel_results.append(future.result())
+
+    findings: list[dict[str, Any]] = []
+    observed_scopes = [requirements_stage.get("observed_scope", {})]
+    if preprocessed_ocr and require_word_extract:
+        observed_scopes.append(
+            {
+                "tender_total_pages_seen": 0,
+                "tender_sections_reviewed": [],
+                "bid_sections_reviewed": [],
+                "docx_image_count_seen": int(preprocessed_ocr.get("image_count", 0) or 0),
+                "docx_ocr_completed": bool(preprocessed_ocr.get("completed", False)),
+            }
+        )
+    raw_parts = [
+        f"[REQUIREMENTS_STAGE]\n{requirements_stage.get('raw_output', '')}",
+    ]
+    stage_metrics: dict[str, Any] = {
+        "requirements": {
+            "attempt_count": int(requirements_stage.get("attempt_count", 1) or 1),
+            "duration_ms": int(requirements_stage.get("duration_ms", 0) or 0),
+            "tool_call_count": len(requirements_stage.get("tool_calls", [])),
+            "tool_calls": list(requirements_stage.get("tool_calls", [])),
+            "usage_summary": dict(requirements_stage.get("usage_summary", {})),
+        }
+    }
+    metrics["json_repair_count"] += str(requirements_stage.get("raw_output", "")).count("[JSON_REPAIRED]")
+    for stage_result in parallel_results:
+        stage_name = str(stage_result.get("stage_name", "stage"))
+        stage_findings = _normalize_stage_findings_against_requirements(
+            stage_name,
+            stage_result.get("data", {}),
+            requirements=requirements,
+        )
+        findings.extend(stage_findings)
+        observed_scopes.append(stage_result.get("observed_scope", {}))
+        raw_parts.append(f"[{stage_name.upper()}_STAGE]\n{stage_result.get('raw_output', '')}")
+        stage_metrics[stage_name] = {
+            "attempt_count": int(stage_result.get("attempt_count", 1) or 1),
+            "duration_ms": int(stage_result.get("duration_ms", 0) or 0),
+            "tool_call_count": len(stage_result.get("tool_calls", [])),
+            "tool_calls": list(stage_result.get("tool_calls", [])),
+            "usage_summary": dict(stage_result.get("usage_summary", {})),
+        }
+        metrics["review_attempt_count"] += int(stage_result.get("attempt_count", 1) or 1)
+        metrics["json_repair_count"] += str(stage_result.get("raw_output", "")).count("[JSON_REPAIRED]")
+
+    metrics["initial_review_duration_ms"] = int((time.perf_counter() - initial_review_started) * 1000)
+
+    report = {
+        "requirements": requirements,
+        "findings": _dedupe_findings(findings),
+        "summary": {},
+    }
+    report["findings"] = _assign_finding_ids(report.get("findings", []))
+    _refresh_summary(report)
+
+    aggregated_scope = _merge_observed_scopes(observed_scopes)
+    report = _apply_observed_scope_to_report(report, aggregated_scope)
+    completion_failures = _evaluate_review_completion(
+        report,
+        tender_outline=tender_outline,
+        bid_outline=bid_outline,
+        min_requirement_count=min_requirement_count,
+        require_word_extract=require_word_extract,
+        ocr_required=ocr_required,
+    )
+    summary = report.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+        report["summary"] = summary
+    review_scope = summary.get("review_scope")
+    if not isinstance(review_scope, dict):
+        review_scope = {}
+        summary["review_scope"] = review_scope
+    review_scope["completion_check_passed"] = not completion_failures
+    if completion_failures and _completion_gate_enabled():
+        raise ClaudeCallError("多阶段审查结果未满足全文阅读完成门槛：" + "；".join(completion_failures))
+
+    report = _enrich_report_evidence_locations(
+        report,
+        tender_path=tender_path_obj,
+        bid_path=bid_path_obj,
+    )
+
+    force_manual_image_checks = require_word_extract and ocr_required and (not bool(review_scope.get("docx_ocr_completed", False)))
+    report = _apply_stability_guards(
+        report,
+        tender_path=tender_path_obj,
+        bid_path=bid_path_obj,
+        force_manual_image_checks=force_manual_image_checks,
+    )
+
+    merged_raw = "\n\n".join(raw_parts)
+
+    second_pass_flag = os.getenv("BID_REVIEW_ENABLE_SECOND_PASS", "").strip().lower()
+    if second_pass_flag:
+        enable_second_pass = second_pass_flag in {"1", "true", "yes", "on"}
+    else:
+        enable_second_pass = policy.enable_second_pass
+    if enable_second_pass:
+        initial_json = compact_text_for_prompt(json.dumps(report, ensure_ascii=False, indent=2), 8000)
+        second_prompt = render_prompt(
+            "review_second_pass.md",
+            workspace_dir=workspace_dir,
+            tender_stem=tender_stem,
+            bid_stem=bid_stem,
+            tender_path=str(tender_path_obj),
+            bid_path=str(bid_path_obj),
+            user_instruction=user_ins,
+            initial_json=initial_json,
+        )
+        with _prefer_claude_sdk_review_tools(client):
+            second_prompt = _append_no_write_enforcement(second_prompt)
+            second_raw = client.ask_text(second_prompt, task_label=f"二次复核：{bid_path_obj.name}")
+            metrics["second_pass_used"] = True
+            if _has_forbidden_write_tool_call(client.get_last_tool_uses()):
+                second_retry = _append_no_write_enforcement(second_prompt)
+                second_raw = client.ask_text(second_retry, task_label=f"二次复核重试(只读强制)：{bid_path_obj.name}")
+                if _has_forbidden_write_tool_call(client.get_last_tool_uses()) and _strict_fail_on_forbidden_write():
+                    raise ClaudeCallError("二次复核阶段检测到写文件/脚本执行行为，已按只读规则重试1次仍失败。")
+        try:
+            second_data = extract_json_payload(second_raw)
+            add_findings = _normalize_findings(second_data.get("additional_findings", []))
+        except Exception:  # noqa: BLE001
+            add_findings = []
+        if add_findings:
+            add_findings = _normalize_stage_findings_against_requirements(
+                "second_pass",
+                {"findings": add_findings},
+                requirements=report.get("requirements", []),
+            )
+            temp_report = _enrich_report_evidence_locations(
+                {"findings": add_findings},
+                tender_path=tender_path_obj,
+                bid_path=bid_path_obj,
+            )
+            add_findings = temp_report.get("findings", add_findings)
+            report["findings"] = _assign_finding_ids(report["findings"] + add_findings)
+            _refresh_summary(report)
+        merged_raw = f"{merged_raw}\n\n[SECOND_PASS]\n{second_raw}"
+        stage_metrics["second_pass"] = {
+            "attempt_count": 1,
+            "duration_ms": 0,
+            "tool_call_count": len(client.get_last_tool_calls()),
+            "tool_calls": client.get_last_tool_calls(),
+            "usage_summary": getattr(client, "get_last_usage_summary", lambda: {})(),
+        }
+        metrics["json_repair_count"] = merged_raw.count("[JSON_REPAIRED]")
+    else:
+        merged_raw = f"{merged_raw}\n\n[SECOND_PASS]\nSKIPPED_BY_DEFAULT"
+
+    metrics["tool_usage_summary"] = {"stages": stage_metrics}
+    metrics["token_usage_summary"] = {
+        "stages": {
+            name: dict(payload.get("usage_summary", {}))
+            for name, payload in stage_metrics.items()
+        }
+    }
+    _record_last_review_metrics(client, metrics)
+    return report, merged_raw
+
+
+def run_bid_review_with_claude(
+    *,
+    tender_path: str,
+    bid_path: str,
+    client: Any,
+    extra_instruction: str = "",
+    user_instruction: str = "",
+    review_profile: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    if _supports_staged_parallel_review(client):
+        return _run_bid_review_staged(
+            tender_path=tender_path,
+            bid_path=bid_path,
+            client=client,
+            extra_instruction=extra_instruction,
+            user_instruction=user_instruction,
+            review_profile=review_profile,
+        )
+    return _run_bid_review_single_session(
+        tender_path=tender_path,
+        bid_path=bid_path,
+        client=client,
+        extra_instruction=extra_instruction,
+        user_instruction=user_instruction,
+        review_profile=review_profile,
+    )

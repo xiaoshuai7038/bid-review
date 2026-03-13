@@ -231,6 +231,128 @@ def test_run_bid_review_retries_when_review_completion_gate_fails(
     assert len(report["requirements"]) == 6
 
 
+def test_completion_gate_uses_observed_scope_when_model_scope_is_underreported(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("BID_REVIEW_ENABLE_SECOND_PASS", "0")
+    monkeypatch.setenv("BID_REVIEW_DOCX_OCR_REQUIRED", "0")
+    monkeypatch.setattr(
+        "app.review.claude_review._collect_tender_outline",
+        lambda _path: {
+            "total_pages": 50,
+            "sections": [
+                {"title": "第二章 投标人须知", "page_no": 7},
+                {"title": "第五章 技术标准和要求", "page_no": 30},
+                {"title": "第六章 投标文件格式", "page_no": 40},
+            ],
+            "relevant_sections": ["第二章 投标人须知", "第五章 技术标准和要求", "第六章 投标文件格式"],
+        },
+    )
+    monkeypatch.setattr(
+        "app.review.claude_review._collect_bid_outline",
+        lambda _path: {
+            "sections": ["投标函", "开标一览表", "分项报价表", "投标保证金交纳证明", "资格审查申请书", "技术条款偏离表"],
+            "template_sections": ["投标函", "开标一览表", "分项报价表", "投标保证金交纳证明", "资格审查申请书", "技术条款偏离表"],
+            "docx_image_count": 2,
+        },
+    )
+    monkeypatch.setattr(
+        "app.review.claude_review.load_or_build_bid_artifact",
+        lambda _path: type(
+            "Prepared",
+            (),
+            {
+                "data": {
+                    "sections": [
+                        {"id": "214", "title": "投标函", "lines": []},
+                        {"id": "215", "title": "开标一览表", "lines": []},
+                    ]
+                }
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        "app.review.claude_review.extract_or_load_word_image_manifest",
+        lambda _path, filter_policy: type(
+            "Prepared",
+            (),
+            {
+                "data": {
+                    "image_count_raw": 2,
+                    "image_count_unique": 2,
+                    "image_count_skipped": 0,
+                    "image_paths": [],
+                }
+            },
+        )(),
+    )
+
+    underreported = json.dumps(
+        {
+            "requirements": [
+                {"id": "R001", "category": "资格资质", "text": "营业执照等资格材料必须齐全", "source": "s"},
+                {"id": "R002", "category": "响应格式", "text": "投标函抬头必须填写招标人名称", "source": "s"},
+                {"id": "R003", "category": "响应格式", "text": "开标一览表需完整填写", "source": "s"},
+                {"id": "R004", "category": "响应格式", "text": "分项报价表需完整填写", "source": "s"},
+                {"id": "R005", "category": "响应格式", "text": "投标保证金交纳证明需完整填写", "source": "s"},
+                {"id": "R006", "category": "响应格式", "text": "基本账户证明需完整填写", "source": "s"},
+            ],
+            "findings": [],
+            "summary": {
+                "requirement_count": 6,
+                "finding_count": 0,
+                "review_scope": {
+                    "tender_total_pages_seen": 10,
+                    "tender_sections_reviewed": ["第二章 投标人须知"],
+                    "bid_sections_reviewed": ["投标函"],
+                    "docx_image_count_seen": 0,
+                    "docx_ocr_completed": False,
+                    "completion_check_passed": False,
+                },
+            },
+        },
+        ensure_ascii=False,
+    )
+
+    tool_uses = [
+        {
+            "name": "mcp__document-parser__read_pdf_pages",
+            "input": {"file_path": str(tmp_path / "tender.pdf"), "start_page": 18, "end_page": 50},
+        },
+        {
+            "name": "mcp__document-parser__read_word_section",
+            "input": {"file_path": str(tmp_path / "bid.docx"), "section_id": "214"},
+        },
+        {
+            "name": "mcp__document-parser__search_word_text",
+            "input": {"file_path": str(tmp_path / "bid.docx"), "query": "投标函|开标一览表"},
+        },
+        {
+            "name": "mcp__document-parser__extract_images_from_word",
+            "input": {"file_path": str(tmp_path / "bid.docx"), "output_dir": str(tmp_path / "extract")},
+        },
+        {
+            "name": "mcp__paddle-ocr__ocr_images_in_dir",
+            "input": {"dir_path": str(tmp_path / "extract")},
+        },
+    ]
+    client = _FakeClient(underreported, tool_uses=tool_uses)
+
+    report, raw = run_bid_review_with_claude(
+        tender_path=str(tmp_path / "tender.pdf"),
+        bid_path=str(tmp_path / "bid.docx"),
+        client=client,
+        extra_instruction="",
+        user_instruction="",
+    )
+
+    assert "[COMPLETION_RETRY]" not in raw
+    review_scope = report["summary"]["review_scope"]
+    assert review_scope["tender_total_pages_seen"] >= 50
+    assert review_scope["docx_ocr_completed"] is True
+
+
 def test_parse_review_report_from_raw_uses_json_repair_before_full_retry(tmp_path: Path) -> None:
     repaired = {
         "requirements": [{"id": "R001", "category": "响应格式", "text": "投标函应按格式填写", "source": "s"}],

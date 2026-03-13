@@ -84,6 +84,21 @@ def _looks_like_section_heading(text: str) -> bool:
     return False
 
 
+def _is_probable_toc_entry(text: str) -> bool:
+    import re
+
+    stripped = _clean_text(text)
+    if not stripped:
+        return False
+    if stripped == "目录":
+        return True
+    if re.match(r"^(?:第[一二三四五六七八九十百0-9]+章|第[一二三四五六七八九十百0-9]+节).+\s+\d+\s*$", stripped):
+        return True
+    if re.match(r"^(?:\d+(?:\.\d+){0,3}|[一二三四五六七八九十]+)[\.、]?\s*.+\s+\d+\s*$", stripped):
+        return True
+    return False
+
+
 def _normalize_outline_title(text: str) -> str:
     import re
 
@@ -223,11 +238,21 @@ def _build_word_line_index(path: Path) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     current_section = "文档开头"
     section_line_no = 0
+    in_toc = False
 
     def _push_line(raw_text: str) -> None:
-        nonlocal current_section, section_line_no
+        nonlocal current_section, section_line_no, in_toc
         line_text = _clean_text(raw_text)
         if not line_text:
+            return
+        if line_text == "目录":
+            in_toc = True
+            return
+        if in_toc:
+            if _is_probable_toc_entry(line_text):
+                return
+            in_toc = False
+        if _is_probable_toc_entry(line_text):
             return
         if _looks_like_section_heading(line_text):
             current_section = line_text

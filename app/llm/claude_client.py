@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -108,6 +110,46 @@ def _contains_timeout(exc: BaseException) -> bool:
     if isinstance(exc, BaseExceptionGroup):
         return any(_contains_timeout(sub) for sub in exc.exceptions)
     return False
+
+
+def _looks_like_claude_cli_command(command: Any) -> bool:
+    if isinstance(command, (list, tuple)) and command:
+        executable = str(command[0] or "").strip().lower()
+    else:
+        executable = str(command or "").strip().lower()
+    return executable.endswith("claude.exe") or executable.endswith("\\claude") or executable.endswith("/claude")
+
+
+def _patch_sdk_windows_hidden_cli_spawn() -> None:
+    if os.name != "nt":
+        return
+    try:
+        transport_module = importlib.import_module("claude_agent_sdk._internal.transport.subprocess_cli")
+    except Exception:
+        return
+    anyio_module = getattr(transport_module, "anyio", None)
+    if anyio_module is None:
+        return
+    original_open_process = getattr(anyio_module, "open_process", None)
+    if original_open_process is None or getattr(original_open_process, "_bidreview_hide_console_patch", False):
+        return
+
+    async def _open_process_hidden(*args, **kwargs):
+        command = args[0] if args else kwargs.get("command")
+        if _looks_like_claude_cli_command(command):
+            creationflags = int(kwargs.get("creationflags", 0) or 0)
+            creationflags |= int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            kwargs["creationflags"] = creationflags
+            if kwargs.get("startupinfo") is None and hasattr(subprocess, "STARTUPINFO"):
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+                startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+                kwargs["startupinfo"] = startupinfo
+        return await original_open_process(*args, **kwargs)
+
+    setattr(_open_process_hidden, "_bidreview_hide_console_patch", True)
+    setattr(_open_process_hidden, "_bidreview_original_open_process", original_open_process)
+    anyio_module.open_process = _open_process_hidden
 
 
 @dataclass
@@ -249,6 +291,7 @@ class ClaudeClient:
             raise ClaudeCallError(
                 "未安装或无法导入 claude-agent-sdk，请先执行 `uv sync` 安装项目依赖。"
             ) from exc
+        _patch_sdk_windows_hidden_cli_spawn()
         return {
             "AssistantMessage": AssistantMessage,
             "ClaudeAgentOptions": ClaudeAgentOptions,

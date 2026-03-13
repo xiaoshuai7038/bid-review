@@ -11,6 +11,7 @@ BidReviewDesktopDebug.spec
 tasks/
 tmp/
 temp_*.txt
+data/cache/
 
 # local tool settings
 .claude/settings.local.json

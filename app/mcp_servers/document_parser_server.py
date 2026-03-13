@@ -48,6 +48,23 @@ def _review_policy() -> ReviewExecutionPolicy:
     return ReviewExecutionPolicy.for_profile(profile)
 
 
+def _safe_word_image_output_dir(output_dir: str | None) -> Path | None:
+    raw = str(output_dir or "").strip()
+    if not raw:
+        return None
+    managed_root = default_document_parser_temp_root()
+    if managed_root is None:
+        return Path(raw).expanduser().resolve()
+    parent = ensure_dir(managed_root).resolve()
+    requested = Path(raw).expanduser().resolve()
+    try:
+        requested.relative_to(parent)
+        return requested
+    except ValueError:
+        safe_name = requested.name or "word_images"
+        return (parent / safe_name).resolve()
+
+
 def _read_pdf_text(file_path: str) -> str:
     path = Path(file_path).expanduser().resolve()
     if not path.exists():
@@ -106,8 +123,9 @@ def _extract_images_from_word_legacy(file_path: str, output_dir: str | None = No
     if path.suffix.lower() != ".docx":
         return {"error": "仅支持 .docx 文件"}
 
-    if output_dir:
-        out_dir = Path(output_dir).expanduser().resolve()
+    safe_output_dir = _safe_word_image_output_dir(output_dir)
+    if safe_output_dir is not None:
+        out_dir = safe_output_dir
         out_dir.mkdir(parents=True, exist_ok=True)
     else:
         managed_root = default_document_parser_temp_root()
@@ -154,8 +172,9 @@ def _extract_images_from_word_legacy(file_path: str, output_dir: str | None = No
 
 
 def _extract_images_from_word(file_path: str, output_dir: str | None = None) -> dict[str, Any]:
-    if output_dir:
-        return _extract_images_from_word_legacy(file_path, output_dir)
+    safe_output_dir = _safe_word_image_output_dir(output_dir)
+    if safe_output_dir is not None:
+        return _extract_images_from_word_legacy(file_path, str(safe_output_dir))
     path = Path(file_path).expanduser().resolve()
     if not path.exists():
         return {"error": f"文件不存在 - {path}"}
@@ -190,14 +209,40 @@ def _pdf_line_groups(file_path: str) -> list[dict[str, Any]]:
     return [{"page_no": page_no, "lines": lines} for page_no, lines in sorted(pages.items())]
 
 
+def _split_search_terms(query: str) -> list[str]:
+    raw = str(query or "").strip()
+    if not raw:
+        return []
+    chunks = []
+    for piece in raw.replace("\r", "\n").split("\n"):
+        chunks.extend(piece.split("|"))
+    terms: list[str] = []
+    seen: set[str] = set()
+    for chunk in chunks:
+        term = chunk.strip()
+        if not term:
+            continue
+        key = term.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        terms.append(term)
+    return terms or [raw]
+
+
 def _search_hits(lines: list[dict[str, Any]], query: str, *, max_hits: int, context_lines: int) -> list[dict[str, Any]]:
-    lowered = query.strip().lower()
-    normalized = "".join(ch for ch in lowered if not ch.isspace())
+    terms = _split_search_terms(query)
+    lowered_terms = [term.lower() for term in terms]
+    normalized_terms = ["".join(ch for ch in term.lower() if not ch.isspace()) for term in terms]
     hits: list[dict[str, Any]] = []
     for index, item in enumerate(lines):
         text = str(item.get("text", "") or "")
         norm = str(item.get("norm", "") or "")
-        if lowered not in text.lower() and normalized not in norm:
+        if not any(
+            term in text.lower() or normalized in norm
+            for term, normalized in zip(lowered_terms, normalized_terms)
+            if term or normalized
+        ):
             continue
         start = max(0, index - context_lines)
         end = min(len(lines), index + context_lines + 1)
@@ -285,14 +330,14 @@ async def search_pdf_text(file_path: str, query: str, max_hits: int = 20, contex
 @mcp.tool()
 async def get_word_outline(file_path: str) -> str:
     artifact = load_or_build_bid_artifact(Path(file_path).expanduser().resolve()).data
-    sections = []
+    all_sections = []
     for item in artifact.get("sections", []):
         if not isinstance(item, dict):
             continue
         lines = item.get("lines", [])
         first_line = int(lines[0].get("line_no", 0) or 0) if lines else 0
         last_line = int(lines[-1].get("line_no", 0) or 0) if lines else 0
-        sections.append(
+        all_sections.append(
             {
                 "section_id": item.get("id", ""),
                 "title": item.get("title", ""),
@@ -302,11 +347,13 @@ async def get_word_outline(file_path: str) -> str:
             }
         )
     outline = artifact.get("outline", {})
+    sections = all_sections[:120]
     return json.dumps(
         {
             "file_path": str(Path(file_path).expanduser().resolve()),
             "file_hash": artifact.get("file_hash"),
             "cache_hit": artifact.get("cache_hit", False),
+            "section_count_total": len(all_sections),
             "sections": sections,
             "template_sections": outline.get("template_sections", []),
             "docx_image_count": outline.get("docx_image_count", 0),
@@ -321,6 +368,31 @@ async def read_word_section(file_path: str, section_id: str) -> str:
     artifact = load_or_build_bid_artifact(Path(file_path).expanduser().resolve()).data
     sections = artifact.get("sections", [])
     target = next((item for item in sections if isinstance(item, dict) and str(item.get("id", "")) == str(section_id)), None)
+    if not isinstance(target, dict):
+        needle = str(section_id or "").strip()
+        lowered = needle.lower()
+        target = next(
+            (
+                item
+                for item in sections
+                if isinstance(item, dict)
+                and str(item.get("title", "") or "").strip().lower() == lowered
+            ),
+            None,
+        )
+    if not isinstance(target, dict):
+        needle = str(section_id or "").strip()
+        lowered = needle.lower()
+        target = next(
+            (
+                item
+                for item in sections
+                if isinstance(item, dict)
+                and lowered
+                and lowered in str(item.get("title", "") or "").strip().lower()
+            ),
+            None,
+        )
     if not isinstance(target, dict):
         return json.dumps({"error": f"未找到 section_id={section_id}"}, ensure_ascii=False, indent=2)
     return json.dumps(

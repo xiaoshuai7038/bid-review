@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from app.llm.claude_client import ClaudeCallError, _contains_timeout, _exception_detail
-from app.llm.claude_client import ClaudeClient
+from app.llm.claude_client import ClaudeClient, _patch_sdk_windows_hidden_cli_spawn
 
 
 def test_exception_detail_unwraps_exception_group() -> None:
@@ -143,3 +144,49 @@ def test_repair_json_text_requires_top_keys(monkeypatch) -> None:
         assert "缺少字段" in str(exc)
     else:
         raise AssertionError("repair_json_text should enforce required top keys")
+
+
+def test_patch_sdk_windows_hidden_cli_spawn_injects_hidden_process_flags(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def _fake_open_process(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return object()
+
+    fake_anyio = SimpleNamespace(open_process=_fake_open_process)
+    fake_module = SimpleNamespace(anyio=fake_anyio)
+
+    monkeypatch.setattr("app.llm.claude_client.os.name", "nt")
+    monkeypatch.setattr("app.llm.claude_client.importlib.import_module", lambda _name: fake_module)
+
+    _patch_sdk_windows_hidden_cli_spawn()
+    patched = fake_anyio.open_process
+
+    assert getattr(patched, "_bidreview_hide_console_patch", False) is True
+
+    import anyio
+
+    anyio.run(patched, ["C:/tool/claude.exe", "-v"])
+
+    kwargs = captured["kwargs"]
+    assert int(kwargs["creationflags"]) != 0
+    assert kwargs["startupinfo"] is not None
+
+
+def test_patch_sdk_windows_hidden_cli_spawn_is_idempotent(monkeypatch) -> None:
+    async def _fake_open_process(*args, **kwargs):
+        return object()
+
+    fake_anyio = SimpleNamespace(open_process=_fake_open_process)
+    fake_module = SimpleNamespace(anyio=fake_anyio)
+
+    monkeypatch.setattr("app.llm.claude_client.os.name", "nt")
+    monkeypatch.setattr("app.llm.claude_client.importlib.import_module", lambda _name: fake_module)
+
+    _patch_sdk_windows_hidden_cli_spawn()
+    first = fake_anyio.open_process
+    _patch_sdk_windows_hidden_cli_spawn()
+    second = fake_anyio.open_process
+
+    assert first is second
