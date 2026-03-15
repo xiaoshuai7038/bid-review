@@ -17,6 +17,8 @@ RUN_CONTEXT_DIR_ENV = "BID_REVIEW_RUN_CONTEXT_DIR"
 REVIEW_PROFILE_ENV = "BID_REVIEW_REVIEW_PROFILE"
 RUNTIME_HOST_EXE_NAME = "BidReviewRuntimeHost.exe"
 PORTABLE_GIT_DIRNAME = "git"
+NODEJS_DIRNAME = "nodejs"
+OPENCODE_RUNTIME_DIRNAME = "opencode"
 
 
 def is_frozen() -> bool:
@@ -173,6 +175,35 @@ def default_portable_git_root() -> Path | None:
     if not is_frozen():
         return None
     candidate = (app_root() / "third-party" / PORTABLE_GIT_DIRNAME).resolve()
+    if candidate.exists() and candidate.is_dir():
+        return candidate
+    return None
+
+
+def default_bundled_node_root() -> Path | None:
+    if not is_frozen():
+        return None
+    candidate = (app_root() / "third-party" / NODEJS_DIRNAME).resolve()
+    if candidate.exists() and candidate.is_dir():
+        return candidate
+    return None
+
+
+def default_bundled_node_exe() -> Path | None:
+    node_root = default_bundled_node_root()
+    if node_root is None:
+        return None
+    exe_name = "node.exe" if os.name == "nt" else "node"
+    candidate = (node_root / exe_name).resolve()
+    if candidate.exists() and candidate.is_file():
+        return candidate
+    return None
+
+
+def default_bundled_opencode_runtime_root() -> Path | None:
+    if not is_frozen():
+        return None
+    candidate = (app_root() / "third-party" / OPENCODE_RUNTIME_DIRNAME).resolve()
     if candidate.exists() and candidate.is_dir():
         return candidate
     return None

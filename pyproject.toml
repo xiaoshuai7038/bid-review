@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bid-review"
 version = "0.1.0"
-description = "Tender/Bid compliance review pipeline driven by Claude SDK runtime and OpenCode CLI."
+description = "Tender/Bid compliance review pipeline driven by Claude SDK runtime and OpenCode SDK runtime."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -31,7 +31,12 @@ include-package-data = true
 include = ["app*"]
 
 [tool.setuptools.package-data]
-app = ["llm/prompts/*.md", "gui/assets/*.*"]
+app = [
+  "ai/prompts/templates/shared/*.md",
+  "ai/prompts/templates/review/*.md",
+  "ai/prompts/templates/role_detection/*.md",
+  "gui/assets/*.*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

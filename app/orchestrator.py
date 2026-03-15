@@ -9,7 +9,7 @@ import re
 import sys
 from typing import Any, Callable
 
-from app.llm import create_llm_client
+from app.ai import create_llm_client
 from app.report import write_docx_report, write_json_report, write_markdown_report
 from app.report.to_json import write_raw_text
 from app.runtime_paths import REVIEW_PROFILE_ENV, default_output_root, managed_runtime_enabled
@@ -76,7 +76,12 @@ def _emit_pipeline_message(
             progress_callback(message, level)
         except Exception:
             pass
-    print(message, file=sys.stderr, flush=True)
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        # Windowed/frozen desktop builds may expose an invalid stderr handle.
+        # Progress delivery to the GUI callback must remain best-effort and non-fatal.
+        pass
 
 
 def run_pipeline(
@@ -146,8 +151,13 @@ def run_pipeline(
             raise RuntimeError(
                 "未检测到可用的 Claude SDK 运行时。请先执行 `uv sync` 安装依赖，并配置 ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY。"
             )
+        unavailable_reason = getattr(client, "unavailable_reason", None)
+        if callable(unavailable_reason):
+            detail = unavailable_reason()
+            if detail:
+                raise RuntimeError(detail)
         raise RuntimeError(
-            "未检测到可用的 opencode CLI，请先安装并完成认证，或传入 --opencode-api-key/--opencode-api-url。"
+            "未检测到可用的 OpenCode SDK 运行时。请先在仓库根目录执行 `npm install` 安装本地 runtime，或显式传入 --opencode-bin 使用 legacy CLI。"
         )
 
     if tender_path and bid_paths:

@@ -4,10 +4,23 @@
 
 下文命令中的文件路径均为占位示例，请替换为你本机的实际文件路径：
 
-1. 本地项目把文件路径和任务提示词交给 Claude SDK 运行时或 OpenCode CLI（默认 `claude`，可切换 `opencode`）。
+1. 本地项目把文件路径和任务提示词交给 Claude SDK 运行时或 OpenCode SDK runtime（默认 `claude`，可切换 `opencode`）。
 2. 文档解析、招投标识别、硬性条款提取、逐条审查全部由所选后端执行。
 3. 本地项目只负责接收返回 JSON，并导出 `markdown + json + docx` 报告。
 4. 默认包含“主体名词上下文一致性校验”：会检查招标人/投标人/开户银行等名词是否出现在正确位置与正确主体语境中。
+
+## 代码组织
+
+当前仓库将 AI/LLM 集成层按职责归到 `app/ai/`：
+
+- `app/ai/providers/`：Claude / OpenCode provider SDK 与 runtime 集成
+- `app/ai/prompts/`：prompt loader、catalog 与分类模板目录
+- `app/ai/mcp/`：项目级 MCP/runtime 配置拼装
+- `app/ai/core/`：共用的进度、JSON 输出和文本辅助入口
+
+`app/llm/` 仍保留为兼容层，用于承接旧导入路径；新代码优先使用 `app.ai.*`。
+
+`app/review/workflows/` 提供 review workflow 的分类入口；`app/review/claude_review.py` 当前保留为 legacy compatibility shim。
 
 ## 运行
 
@@ -15,7 +28,13 @@
 
 ```bash
 uv sync
+npm install
 ```
+
+如果需要重新打包桌面交付包并让其支持 OpenCode，构建机还需要：
+
+- 已安装可运行的 Node.js（构建脚本会复制本机 Node runtime 到桌面包）
+- 仓库根目录已完成 `npm install`，本地 `node_modules` 中存在 `@opencode-ai/sdk`、`opencode-ai` 及对应平台运行资源
 
 然后运行（PowerShell）：
 
@@ -144,8 +163,26 @@ uv run python -m app.main `
   --output-dir "data/output"
 ```
 
+`opencode` 后端默认走仓库内本地 OpenCode runtime：
+
+- Node 侧依赖通过仓库根目录的 `package.json` + `package-lock.json` 管理
+- `npm install` 会安装本地 `@opencode-ai/sdk` 与 `opencode-ai`
+- 运行时会优先使用仓库内 `node_modules/.bin/opencode`，不依赖客户机全局安装 `opencode`
+
 默认情况下，`--backend opencode` 也会优先使用仓库内统一管理的 MCP 配置。
 如需显式指定，也可以继续传 `--mcp-config`（支持 Claude 风格 `mcpServers` JSON）；显式传入时会覆盖项目默认配置。
+
+如需显式回退到 legacy OpenCode CLI 路径，也可以继续传：
+
+```powershell
+uv run python -m app.main `
+  --backend opencode `
+  --opencode-bin "C:\path\to\opencode.exe" `
+  --input "C:\path\to\tender-document.pdf" `
+  --input "C:\path\to\bid-document.docx"
+```
+
+`--opencode-bin` 现在仅表示“显式启用 legacy CLI override”，不再是默认依赖。
 
 如不需要保存每次运行的原始文本（`claude_raw_output.txt`），可加：
 
@@ -270,6 +307,8 @@ uv run python -m app.main `
 - `Claude Agent SDK` 所需的 bundled `claude.exe`
 - 项目内置 MCP 的 runtime host：`BidReviewRuntimeHost.exe`
 - 供 `Claude Code` 在 Windows 上使用的 portable Git Bash runtime：`third-party\git\`
+- OpenCode 所需的本地 Node runtime：`third-party\nodejs\`
+- OpenCode 所需的本地 runtime 资源：`third-party\opencode\`
 
 其中 `BidReviewRuntimeHost.exe` 仅供桌面程序在后台拉起 `document-parser` / `paddle-ocr` MCP 使用，用户无需手动启动。
 Windows 客户机默认无需再单独安装 Git for Windows；桌面包会优先使用包内 `third-party\git\bin\bash.exe`。
@@ -281,9 +320,9 @@ $env:CLAUDE_CODE_GIT_BASH_PATH = "C:\Program Files\Git\bin\bash.exe"
 
 首期客户交付范围：
 
-- 仅支持 `Claude` 后端
-- `ANTHROPIC_AUTH_TOKEN`、模型、base URL 等参数由用户在 GUI 中自行配置
-- 不处理 `OpenCode` 的客户交付、CLI 分发或运行保障
+- 支持 `Claude` 和 `OpenCode` 两种后端
+- `ANTHROPIC_AUTH_TOKEN`、Claude/OpenCode 模型、base URL、API key 等参数由用户在 GUI 中自行配置
+- 桌面包会内置 OpenCode 运行所需的 Node/OpenCode runtime，本机无需额外安装 Node、npm 或全局 `opencode`
 
 执行：
 
@@ -369,7 +408,7 @@ third-party\git\BID_REVIEW_PORTABLE_GIT.txt
 对于第三方运行时目录：
 
 - Claude Code / Claude SDK 运行时的 `~/.claude/projects/.../tool-results`
-- OpenCode 自身的 storage/cache/log
+- OpenCode 本地 runtime 自身的 storage/cache/log（冻结态会优先落在包内隔离 runtime home）
 
 项目会尽量提供实验性配置入口，但不保证所有第三方目录都能完全迁离用户目录；实际能力以所用运行时版本是否支持为准。
 
@@ -411,10 +450,12 @@ $env:BID_REVIEW_ENABLE_OPENCODE_DATA_DIRECTORY = "1"
 - `uv`（已用于环境和依赖管理）
 - `claude` 后端无需额外全局安装 `claude` CLI；执行 `uv sync` 后会安装项目依赖中的 `claude-agent-sdk`
 - 若重新打包桌面交付包，构建机需能提供 Git for Windows runtime（默认会自动探测本机 Git 安装目录，或通过 `-PortableGitRoot` 指定）
+- 若重新打包桌面交付包并希望支持 OpenCode，构建机需能提供 Node.js runtime（默认会自动探测本机 `node.exe` 所在目录），且仓库已执行 `npm install`
 - 使用 `claude` 后端时，需配置 `ANTHROPIC_AUTH_TOKEN`
 - 可选：`ANTHROPIC_MODEL`
 - 可选：`ANTHROPIC_BASE_URL`
-- 如使用 OpenCode 后端：本机已安装并可运行 `opencode` CLI（`opencode --version`）
+- 如使用 OpenCode 后端（源码态）：需先在仓库根目录执行 `npm install`，本机需有可用的 `node` / `npm`
+- 如使用打包后的桌面包并选择 OpenCode 后端：不需要额外安装 Node、npm 或全局 `opencode`
 - 如使用 OpenCode 后端并希望复用 OCR/PDF/Word 工具：本机已安装对应 Claude MCP，或通过 `--mcp-config` 显式传入
 - `claude` 侧已配置 PDF/Word/OCR 的 MCP（推荐）
 - 已安装依赖（见 `pyproject.toml`）
@@ -426,6 +467,7 @@ $env:BID_REVIEW_ENABLE_OPENCODE_DATA_DIRECTORY = "1"
 - 默认后端是 `claude`；可用 `--backend opencode` 切换。
 - 默认不显式指定 Claude 模型参数时，会优先读取 `ANTHROPIC_MODEL`；如需临时覆盖可传 `--model`。
 - `claude` 后端通过项目内置 Claude Agent SDK 调远端模型，不是本地离线推理。
-- 默认不显式指定 OpenCode 模型与网关时，沿用你本机 OpenCode 已配置的默认值；如需临时覆盖，可传 `--opencode-provider/--opencode-api-url/--opencode-model/--opencode-api-key`。
+- 默认不显式指定 OpenCode 模型与网关时，会沿用当前 OpenCode runtime 可见的配置；如需临时覆盖，可传 `--opencode-provider/--opencode-api-url/--opencode-model/--opencode-api-key`。
+- `opencode` 后端默认不再依赖全局 `opencode` CLI；如需显式回退 legacy CLI，可传 `--opencode-bin`。
 - 提示词已配置化，位于 `app/llm/prompts/`（可直接修改模板）。
 - 可通过环境变量 `BID_REVIEW_PROMPTS_DIR` 指向自定义提示词目录（文件名需保持一致）。

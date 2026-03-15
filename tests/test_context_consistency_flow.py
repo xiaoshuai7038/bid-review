@@ -353,6 +353,114 @@ def test_completion_gate_uses_observed_scope_when_model_scope_is_underreported(
     assert review_scope["docx_ocr_completed"] is True
 
 
+def test_completion_gate_allows_small_tail_page_gap_when_key_sections_are_covered() -> None:
+    from app.review.claude_review import _evaluate_review_completion
+
+    raw_data = {
+        "requirements": [
+            {"id": f"R{i:03d}", "category": "响应格式", "text": f"要求{i}", "source": "s"}
+            for i in range(1, 11)
+        ],
+        "summary": {
+            "review_scope": {
+                "tender_total_pages_seen": 100,
+                "tender_sections_reviewed": [
+                    "第二章 投标人须知",
+                    "投标人须知前附表",
+                    "第三章 评标办法",
+                    "评标办法前附表",
+                    "第五章 技术标准和要求",
+                    "第六章 投标文件格式",
+                ],
+                "bid_sections_reviewed": ["投标函", "开标一览表", "分项报价表", "技术条款偏离表"],
+                "docx_image_count_seen": 0,
+                "docx_ocr_completed": True,
+                "completion_check_passed": False,
+            }
+        },
+    }
+    tender_outline = {
+        "total_pages": 103,
+        "relevant_sections": [
+            "第二章 投标人须知",
+            "投标人须知前附表",
+            "第三章 评标办法",
+            "评标办法前附表",
+            "第五章 技术标准和要求",
+            "第六章 投标文件格式",
+        ],
+    }
+    bid_outline = {
+        "template_sections": ["投标函", "开标一览表", "分项报价表", "技术条款偏离表"],
+        "docx_image_count": 0,
+    }
+
+    reasons = _evaluate_review_completion(
+        raw_data,
+        tender_outline=tender_outline,
+        bid_outline=bid_outline,
+        min_requirement_count=6,
+        require_word_extract=False,
+        ocr_required=False,
+    )
+
+    assert reasons == []
+
+
+def test_completion_gate_still_blocks_large_page_gap_even_when_key_sections_are_covered() -> None:
+    from app.review.claude_review import _evaluate_review_completion
+
+    raw_data = {
+        "requirements": [
+            {"id": f"R{i:03d}", "category": "响应格式", "text": f"要求{i}", "source": "s"}
+            for i in range(1, 11)
+        ],
+        "summary": {
+            "review_scope": {
+                "tender_total_pages_seen": 90,
+                "tender_sections_reviewed": [
+                    "第二章 投标人须知",
+                    "投标人须知前附表",
+                    "第三章 评标办法",
+                    "评标办法前附表",
+                    "第五章 技术标准和要求",
+                    "第六章 投标文件格式",
+                ],
+                "bid_sections_reviewed": ["投标函", "开标一览表", "分项报价表", "技术条款偏离表"],
+                "docx_image_count_seen": 0,
+                "docx_ocr_completed": True,
+                "completion_check_passed": False,
+            }
+        },
+    }
+    tender_outline = {
+        "total_pages": 103,
+        "relevant_sections": [
+            "第二章 投标人须知",
+            "投标人须知前附表",
+            "第三章 评标办法",
+            "评标办法前附表",
+            "第五章 技术标准和要求",
+            "第六章 投标文件格式",
+        ],
+    }
+    bid_outline = {
+        "template_sections": ["投标函", "开标一览表", "分项报价表", "技术条款偏离表"],
+        "docx_image_count": 0,
+    }
+
+    reasons = _evaluate_review_completion(
+        raw_data,
+        tender_outline=tender_outline,
+        bid_outline=bid_outline,
+        min_requirement_count=6,
+        require_word_extract=False,
+        ocr_required=False,
+    )
+
+    assert any("90/103" in reason for reason in reasons)
+
+
 def test_parse_review_report_from_raw_uses_json_repair_before_full_retry(tmp_path: Path) -> None:
     repaired = {
         "requirements": [{"id": "R001", "category": "响应格式", "text": "投标函应按格式填写", "source": "s"}],

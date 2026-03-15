@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import os
 import re
+from dataclasses import dataclass
 
 from PySide6.QtCore import QDateTime, QEvent, QPoint, Qt, Signal, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPixmap
@@ -1609,6 +1610,8 @@ class MainWindow(QMainWindow):
         self.session_claude_auth_token = os.getenv("ANTHROPIC_AUTH_TOKEN") or os.getenv("ANTHROPIC_API_KEY", "")
         self.session_api_key = os.getenv("BID_REVIEW_OPENCODE_API_KEY") or os.getenv("OPENCODE_API_KEY", "")
         self.current_result: BatchReviewData | None = None
+        self._automation_request: object | None = None
+        self._automation_app = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1779,12 +1782,18 @@ class MainWindow(QMainWindow):
 
     def _start_review(self) -> None:
         if self._worker is not None and self._worker.isRunning():
+            if self._automation_request is not None:
+                self._finish_automation(False, "当前已有审查任务在执行。")
+                return
             QMessageBox.information(self, "任务运行中", "当前已有审查任务在执行。")
             return
         try:
             request = self.review_page.build_request(self.settings, self.session_api_key)
             request.validate()
         except Exception as exc:  # noqa: BLE001
+            if self._automation_request is not None:
+                self._finish_automation(False, str(exc))
+                return
             QMessageBox.warning(self, "无法启动", str(exc))
             return
 
@@ -1808,6 +1817,10 @@ class MainWindow(QMainWindow):
         self.review_page.result_value.setText("失败")
         self.status_badge.setText("失败")
         self.review_page.append_progress(f"[工作台] {message}", "basic")
+        if self._automation_request is not None:
+            self._finish_automation(False, message)
+            self._worker = None
+            return
         QMessageBox.critical(self, "审查失败", message)
         self._worker = None
 
@@ -1826,4 +1839,46 @@ class MainWindow(QMainWindow):
             except Exception as exc:  # noqa: BLE001
                 self.review_page.append_progress(f"[工作台] 保存最近结果失败：{exc}", "basic")
             self._set_current_page(2)
+        if self._automation_request is not None:
+            self._finish_automation(True, "")
         self._worker = None
+
+    def start_automation_review(self, automation_request: object, app: object) -> None:
+        self._automation_request = automation_request
+        self._automation_app = app
+        request = automation_request
+        self._set_current_page(1)
+        self.review_page.tender_card.set_file(str(Path(request.tender_path).expanduser().resolve()))
+        self.review_page.bid_card.set_paths(
+            [str(Path(path).expanduser().resolve()) for path in request.bid_paths]
+        )
+        _set_combo_value(self.review_page.backend_combo, str(request.backend))
+        if getattr(request, "model", ""):
+            self.review_page.model_edit.setText(str(request.model).strip())
+        self.review_page.output_dir_edit.setText(str(Path(request.output_dir).expanduser().resolve()))
+        if getattr(request, "review_profile", ""):
+            _set_combo_value(self.review_page.review_profile_combo, str(request.review_profile))
+        if int(getattr(request, "timeout_sec", 0) or 0) > 0:
+            self.review_page.timeout_spin.setValue(int(request.timeout_sec))
+        self._start_review()
+
+    def _finish_automation(self, success: bool, message: str) -> None:
+        if self._automation_request is None or self._automation_app is None:
+            return
+        exit_code = 0 if success else 1
+        screenshot_path = str(getattr(self._automation_request, "screenshot", "") or "").strip()
+        if screenshot_path:
+            target = Path(screenshot_path).expanduser().resolve()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            self._automation_app.processEvents()
+            self.repaint()
+            self._automation_app.processEvents()
+            saved = self.grab().save(str(target))
+            if not saved or not target.exists():
+                exit_code = 1
+        if not success and message:
+            self.review_page.append_progress(f"[工作台][automation] {message}", "basic")
+        app = self._automation_app
+        self._automation_request = None
+        self._automation_app = None
+        app.exit(exit_code)

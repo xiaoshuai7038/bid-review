@@ -24,7 +24,7 @@ def _merge_non_empty(parts: list[str]) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="将招标/投标文件交给 Claude SDK 或 OpenCode CLI 执行标书审查并输出报告。"
+        description="将招标/投标文件交给 Claude SDK 或 OpenCode SDK runtime 执行标书审查并输出报告。"
     )
     parser.add_argument(
         "--backend",
@@ -64,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--opencode-bin",
         type=str,
         default=None,
-        help="可选，opencode 可执行文件路径。",
+        help="可选，显式启用 legacy OpenCode CLI 路径时使用的 opencode 可执行文件。",
     )
     parser.add_argument(
         "--opencode-provider",
@@ -76,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--opencode-api-url",
         type=str,
         default=os.getenv("BID_REVIEW_OPENCODE_API_URL"),
-        help="可选，仅 opencode 后端使用的 OpenAI-compatible base URL；未传则沿用本机 OpenCode 配置。",
+        help="可选，仅 opencode 后端使用的 OpenAI-compatible base URL；未传则沿用当前 OpenCode runtime 配置。",
     )
     parser.add_argument(
         "--opencode-api-key",

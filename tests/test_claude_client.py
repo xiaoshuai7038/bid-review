@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -190,3 +191,21 @@ def test_patch_sdk_windows_hidden_cli_spawn_is_idempotent(monkeypatch) -> None:
     second = fake_anyio.open_process
 
     assert first is second
+
+
+def test_claude_emit_progress_tolerates_invalid_stderr_handle(monkeypatch) -> None:
+    seen: list[tuple[str, str]] = []
+
+    class _BrokenStderr(io.TextIOBase):
+        def write(self, s: str) -> int:  # noqa: ANN001
+            raise OSError(22, "Invalid argument")
+
+        def flush(self) -> None:
+            raise OSError(22, "Invalid argument")
+
+    monkeypatch.setattr("app.llm.claude_client.sys.stderr", _BrokenStderr())
+
+    client = ClaudeClient(show_progress=True, progress_level="basic", progress_callback=lambda message, level: seen.append((message, level)))
+    client._emit_progress("[agent] hello", "basic")
+
+    assert seen == [("[agent] hello", "basic")]

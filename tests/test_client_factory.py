@@ -37,7 +37,7 @@ def test_backend_switch_create_opencode_client_prefers_opencode_model() -> None:
     backend, client = create_llm_client(
         backend="opencode",
         claude_bin=None,
-        opencode_bin="opencode",
+        opencode_bin=None,
         model="common-model",
         opencode_model="DeepSeek-V3.2",
         effort="low",
@@ -55,6 +55,7 @@ def test_backend_switch_create_opencode_client_prefers_opencode_model() -> None:
     assert client.model == "DeepSeek-V3.2"
     assert client.api_url == "https://ark.cn-beijing.volces.com/api/coding/v3"
     assert client.mcp_config is not None
+    assert client._use_legacy_cli() is False
 
 
 def test_opencode_model_falls_back_to_env_default(monkeypatch) -> None:
@@ -62,7 +63,7 @@ def test_opencode_model_falls_back_to_env_default(monkeypatch) -> None:
     backend, client = create_llm_client(
         backend="opencode",
         claude_bin=None,
-        opencode_bin="opencode",
+        opencode_bin=None,
         model=None,
         opencode_model=None,
         effort="low",
@@ -84,7 +85,7 @@ def test_opencode_model_falls_back_to_common_model() -> None:
     backend, client = create_llm_client(
         backend="opencode",
         claude_bin=None,
-        opencode_bin="opencode",
+        opencode_bin=None,
         model="common-model",
         opencode_model=None,
         effort="low",
@@ -107,7 +108,7 @@ def test_opencode_model_defaults_to_cli_when_unspecified(monkeypatch) -> None:
     backend, client = create_llm_client(
         backend="opencode",
         claude_bin=None,
-        opencode_bin="opencode",
+        opencode_bin=None,
         model=None,
         opencode_model=None,
         effort="low",
@@ -129,7 +130,7 @@ def test_opencode_client_receives_mcp_config() -> None:
     backend, client = create_llm_client(
         backend="opencode",
         claude_bin=None,
-        opencode_bin="opencode",
+        opencode_bin=None,
         model=None,
         opencode_model="DeepSeek-V3.2",
         effort="low",
@@ -145,3 +146,26 @@ def test_opencode_client_receives_mcp_config() -> None:
     assert backend == "opencode"
     assert isinstance(client, OpenCodeClient)
     assert client.mcp_config is not None
+
+
+def test_opencode_client_uses_legacy_cli_only_when_opencode_bin_is_explicit() -> None:
+    backend, client = create_llm_client(
+        backend="opencode",
+        claude_bin=None,
+        opencode_bin="C:/tools/opencode.exe",
+        model=None,
+        opencode_model="DeepSeek-V3.2",
+        effort="low",
+        show_progress=False,
+        progress_level="basic",
+        timeout_sec=10,
+        workspace="D:/code/bidreview",
+        mcp_config=None,
+        opencode_api_key=None,
+        opencode_api_url=None,
+        opencode_provider="ark",
+    )
+    assert backend == "opencode"
+    assert isinstance(client, OpenCodeClient)
+    assert client._use_legacy_cli() is True
+    assert client.opencode_bin == "C:/tools/opencode.exe"

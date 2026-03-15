@@ -2,7 +2,8 @@ param(
     [switch]$Clean,
     [ValidateSet("onedir", "launcher", "standalone")]
     [string]$Mode = "onedir",
-    [string]$PortableGitRoot = ""
+    [string]$PortableGitRoot = "",
+    [string]$NodeRuntimeRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -95,6 +96,37 @@ function Get-GitRuntimeRoot([string]$ExplicitRoot) {
     return $null
 }
 
+function Get-NodeRuntimeRoot([string]$ExplicitRoot) {
+    $candidates = @()
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitRoot)) {
+        $candidates += $ExplicitRoot
+    } else {
+        try {
+            $nodeCommand = Get-Command node -ErrorAction Stop
+            if ($nodeCommand.Source) {
+                $candidates += $nodeCommand.Source
+            }
+        } catch {
+            $candidates = @()
+        }
+    }
+
+    foreach ($candidate in $candidates) {
+        if (-not $candidate) {
+            continue
+        }
+        $path = [System.IO.Path]::GetFullPath($candidate)
+        if (Test-Path $path -PathType Leaf) {
+            $path = Split-Path -Parent $path
+        }
+        $nodeExe = Join-Path $path "node.exe"
+        if (Test-Path $nodeExe -PathType Leaf) {
+            return $path
+        }
+    }
+    return $null
+}
+
 function Invoke-RobocopyMirror([string]$Source, [string]$Target) {
     $null = New-Item -ItemType Directory -Path $Target -Force
     robocopy $Source $Target /E /R:2 /W:1 /NFL /NDL /NJH /NJS /NC /NS /NP | Out-Null
@@ -123,6 +155,87 @@ function Stage-PortableGitRuntime([string]$SourceRoot, [string]$TargetRoot) {
         ("PreparedAt: " + [DateTime]::Now.ToString("yyyy-MM-dd HH:mm:ss"))
     ) -join [Environment]::NewLine
     Set-Content -Path (Join-Path $TargetRoot "BID_REVIEW_PORTABLE_GIT.txt") -Value $metadata -Encoding UTF8
+}
+
+function Stage-NodeRuntime([string]$SourceRoot, [string]$TargetRoot) {
+    Invoke-RobocopyMirror -Source $SourceRoot -Target $TargetRoot
+
+    $nodeExe = Join-Path $TargetRoot "node.exe"
+    $nodeVersion = ""
+    if (Test-Path $nodeExe -PathType Leaf) {
+        try {
+            $nodeVersion = (& $nodeExe --version 2>$null).Trim()
+        } catch {
+            $nodeVersion = ""
+        }
+    }
+
+    $metadata = @(
+        "Bundled by BidReview desktop build",
+        "SourceRoot: $SourceRoot",
+        ("NodeVersion: " + ($(if ($nodeVersion) { $nodeVersion } else { "unknown" }))),
+        ("PreparedAt: " + [DateTime]::Now.ToString("yyyy-MM-dd HH:mm:ss"))
+    ) -join [Environment]::NewLine
+    Set-Content -Path (Join-Path $TargetRoot "BID_REVIEW_BUNDLED_NODE.txt") -Value $metadata -Encoding UTF8
+}
+
+function Stage-OpenCodeRuntime([string]$ProjectRoot, [string]$TargetRoot) {
+    $requiredPaths = @(
+        "$ProjectRoot\node_modules\@opencode-ai\sdk",
+        "$ProjectRoot\node_modules\opencode-ai",
+        "$ProjectRoot\node_modules\.bin",
+        "$ProjectRoot\app\ai\providers\opencode\bridge"
+    )
+
+    foreach ($path in $requiredPaths) {
+        if (-not (Test-Path $path)) {
+            throw "Missing required OpenCode runtime path for desktop packaging: $path. Run npm install first."
+        }
+    }
+
+    $optionalPaths = @(
+        "$ProjectRoot\node_modules\opencode-windows-x64",
+        "$ProjectRoot\node_modules\opencode-windows-x64-baseline",
+        "$ProjectRoot\node_modules\opencode-windows-arm64"
+    )
+
+    $copyMap = @(
+        @{ Source = "$ProjectRoot\node_modules\@opencode-ai"; Target = Join-Path $TargetRoot "node_modules\@opencode-ai" },
+        @{ Source = "$ProjectRoot\node_modules\opencode-ai"; Target = Join-Path $TargetRoot "node_modules\opencode-ai" },
+        @{ Source = "$ProjectRoot\node_modules\.bin"; Target = Join-Path $TargetRoot "node_modules\.bin" },
+        @{ Source = "$ProjectRoot\app\ai\providers\opencode\bridge"; Target = Join-Path $TargetRoot "bridge" }
+    )
+    foreach ($path in $optionalPaths) {
+        $name = Split-Path -Leaf $path
+        $copyMap += @{ Source = $path; Target = Join-Path $TargetRoot "node_modules\$name" }
+    }
+
+    foreach ($item in $copyMap) {
+        $path = [string]$item.Source
+        $targetPath = [string]$item.Target
+        if (-not (Test-Path $path)) {
+            continue
+        }
+        if (Test-Path $path -PathType Container) {
+            Invoke-RobocopyMirror -Source $path -Target $targetPath
+        } else {
+            $targetDir = Split-Path -Parent $targetPath
+            $null = New-Item -ItemType Directory -Path $targetDir -Force
+            Copy-Item -Force $path $targetPath
+        }
+    }
+
+    $metadata = @(
+        "Bundled by BidReview desktop build",
+        ("PreparedAt: " + [DateTime]::Now.ToString("yyyy-MM-dd HH:mm:ss")),
+        "RuntimePaths:",
+        " - node_modules\\@opencode-ai",
+        " - node_modules\\opencode-ai",
+        " - node_modules\\.bin",
+        " - bridge",
+        " - optional opencode-windows-* packages if present"
+    ) -join [Environment]::NewLine
+    Set-Content -Path (Join-Path $TargetRoot "BID_REVIEW_BUNDLED_OPENCODE.txt") -Value $metadata -Encoding UTF8
 }
 
 function Remove-BuildTarget([string]$Path) {
@@ -169,6 +282,8 @@ if ($Clean) {
     Remove-Item -Recurse -Force "$ProjectRoot\dist\BidReviewDesktopLauncher" -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force "$ProjectRoot\build\BidReviewDesktop" -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force "$ProjectRoot\build\portable-git" -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force "$ProjectRoot\build\portable-nodejs" -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force "$ProjectRoot\build\portable-opencode" -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force "$ProjectRoot\dist\BidReviewDesktop" -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force "$ProjectRoot\build\BidReviewDesktopStandalone" -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force "$ProjectRoot\dist\BidReviewDesktopStandalone" -ErrorAction SilentlyContinue
@@ -189,6 +304,8 @@ $PrecleanTargets = if ($NormalizedMode -eq "onedir") {
     @(
         "$ProjectRoot\build\bid_review_desktop",
         "$ProjectRoot\build\portable-git",
+        "$ProjectRoot\build\portable-nodejs",
+        "$ProjectRoot\build\portable-opencode",
         "$ProjectRoot\dist\BidReviewDesktop",
         "$ProjectRoot\dist\BidReviewDesktop.zip"
     )
@@ -218,9 +335,20 @@ if ($NormalizedMode -eq "onedir") {
         exit 1
     }
 
+    $nodeRuntimeRoot = Get-NodeRuntimeRoot $NodeRuntimeRoot
+    if (-not $nodeRuntimeRoot) {
+        Write-Error (
+            "Unable to find a Node.js runtime for packaging OpenCode. Install Node.js " +
+            "or use -NodeRuntimeRoot to point to a directory that contains node.exe."
+        )
+        exit 1
+    }
+
     $PythonHome = (& uv run python -c "import sys; from pathlib import Path; print(Path(sys.base_prefix).resolve())").Trim()
     $PythonDlls = Join-Path $PythonHome "DLLs"
     $PortableGitStageRoot = Join-Path "$ProjectRoot\build\portable-git" "git"
+    $PortableNodeStageRoot = Join-Path "$ProjectRoot\build\portable-nodejs" "nodejs"
+    $PortableOpenCodeStageRoot = Join-Path "$ProjectRoot\build\portable-opencode" "opencode"
 
     foreach ($opensslName in @("libcrypto-3-x64.dll", "libssl-3-x64.dll")) {
         $source = Join-Path $PythonDlls $opensslName
@@ -243,6 +371,18 @@ if ($NormalizedMode -eq "onedir") {
     $PortableGitDistRoot = Join-Path "$ProjectRoot\dist\BidReviewDesktop\third-party" "git"
     Remove-Item -Recurse -Force $PortableGitDistRoot -ErrorAction SilentlyContinue
     Stage-PortableGitRuntime -SourceRoot $PortableGitStageRoot -TargetRoot $PortableGitDistRoot
+
+    Remove-Item -Recurse -Force $PortableNodeStageRoot -ErrorAction SilentlyContinue
+    Stage-NodeRuntime -SourceRoot $nodeRuntimeRoot -TargetRoot $PortableNodeStageRoot
+    $PortableNodeDistRoot = Join-Path "$ProjectRoot\dist\BidReviewDesktop\third-party" "nodejs"
+    Remove-Item -Recurse -Force $PortableNodeDistRoot -ErrorAction SilentlyContinue
+    Stage-NodeRuntime -SourceRoot $PortableNodeStageRoot -TargetRoot $PortableNodeDistRoot
+
+    Remove-Item -Recurse -Force $PortableOpenCodeStageRoot -ErrorAction SilentlyContinue
+    Stage-OpenCodeRuntime -ProjectRoot $ProjectRoot -TargetRoot $PortableOpenCodeStageRoot
+    $PortableOpenCodeDistRoot = Join-Path "$ProjectRoot\dist\BidReviewDesktop\third-party" "opencode"
+    Remove-Item -Recurse -Force $PortableOpenCodeDistRoot -ErrorAction SilentlyContinue
+    Stage-OpenCodeRuntime -ProjectRoot $ProjectRoot -TargetRoot $PortableOpenCodeDistRoot
 }
 
 Write-Host ""

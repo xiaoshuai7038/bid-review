@@ -16,6 +16,9 @@ from app.mcp_servers.paddle_ocr_server import _managed_ocr_mkdtemp
 from app.runtime_paths import (
     CLAUDE_CODE_GIT_BASH_PATH_ENV,
     RUNTIME_ROOT_ENV,
+    default_bundled_node_exe,
+    default_bundled_node_root,
+    default_bundled_opencode_runtime_root,
     default_git_bash_path,
     default_portable_git_root,
 )
@@ -170,6 +173,47 @@ def test_default_git_bash_path_prefers_bundled_portable_git_when_frozen(
     monkeypatch.setattr("app.runtime_paths.shutil.which", lambda name: str(path_bash.resolve()) if name == "bash" else None)
 
     assert default_git_bash_path() == bundled_bash.resolve()
+
+
+def test_default_bundled_node_root_uses_third_party_directory_when_frozen(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    bundle_root = tmp_path / "bundle"
+    node_root = bundle_root / "third-party" / "nodejs"
+    node_root.mkdir(parents=True)
+    monkeypatch.setattr("app.runtime_paths.is_frozen", lambda: True)
+    monkeypatch.setattr("app.runtime_paths.app_root", lambda: bundle_root.resolve())
+
+    assert default_bundled_node_root() == node_root.resolve()
+
+
+def test_default_bundled_node_exe_uses_node_executable_when_frozen(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    bundle_root = tmp_path / "bundle"
+    node_exe = bundle_root / "third-party" / "nodejs" / "node.exe"
+    node_exe.parent.mkdir(parents=True)
+    node_exe.write_text("stub", encoding="utf-8")
+    monkeypatch.setattr("app.runtime_paths.is_frozen", lambda: True)
+    monkeypatch.setattr("app.runtime_paths.app_root", lambda: bundle_root.resolve())
+    monkeypatch.setattr("app.runtime_paths.os.name", "nt")
+
+    assert default_bundled_node_exe() == node_exe.resolve()
+
+
+def test_default_bundled_opencode_runtime_root_uses_third_party_directory_when_frozen(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    bundle_root = tmp_path / "bundle"
+    opencode_root = bundle_root / "third-party" / "opencode"
+    opencode_root.mkdir(parents=True)
+    monkeypatch.setattr("app.runtime_paths.is_frozen", lambda: True)
+    monkeypatch.setattr("app.runtime_paths.app_root", lambda: bundle_root.resolve())
+
+    assert default_bundled_opencode_runtime_root() == opencode_root.resolve()
 
 
 def test_opencode_runtime_env_includes_data_directory(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

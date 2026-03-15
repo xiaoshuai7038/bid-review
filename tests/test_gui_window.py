@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import QSizePolicy
@@ -678,6 +679,61 @@ def test_review_page_handles_drop_on_viewport_for_tender_and_bid(tmp_path: Path,
 
     assert page._handle_drop_on_viewport([QUrl.fromLocalFile(str(bid_file))], bid_point) is True
     assert page.bid_card.paths() == [str(bid_file.resolve())]
+
+    window.close()
+    app.quit()
+
+
+def test_main_window_start_automation_review_populates_form_and_starts(tmp_path: Path, monkeypatch) -> None:
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "default_backend": "claude",
+                "default_output_dir": str(tmp_path / "output"),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BID_REVIEW_GUI_SETTINGS_PATH", str(settings_path))
+
+    tender_file = tmp_path / "招标文件.pdf"
+    bid_file = tmp_path / "投标文件.docx"
+    tender_file.write_text("tender", encoding="utf-8")
+    bid_file.write_text("bid", encoding="utf-8")
+
+    app = create_application([])
+    window = MainWindow()
+    window.show()
+    app.processEvents()
+
+    called: dict[str, bool] = {"started": False}
+    monkeypatch.setattr(window, "_start_review", lambda: called.__setitem__("started", True))
+
+    request = SimpleNamespace(
+        backend="opencode",
+        tender_path=str(tender_file),
+        bid_paths=[str(bid_file)],
+        output_dir=str(tmp_path / "review-output"),
+        screenshot=str(tmp_path / "review.png"),
+        model="DeepSeek-V3.2",
+        review_profile="fast",
+        timeout_sec=2400,
+    )
+
+    window.start_automation_review(request, app)
+    app.processEvents()
+
+    assert window.stack.currentIndex() == 1
+    assert window.review_page.tender_card.file_path() == str(tender_file.resolve())
+    assert window.review_page.bid_card.paths() == [str(bid_file.resolve())]
+    assert window.review_page.backend_combo.currentData() == "opencode"
+    assert window.review_page.model_edit.text() == "DeepSeek-V3.2"
+    assert window.review_page.output_dir_edit.text() == str((tmp_path / "review-output").resolve())
+    assert window.review_page.review_profile_combo.currentData() == "fast"
+    assert window.review_page.timeout_spin.value() == 2400
+    assert called["started"] is True
 
     window.close()
     app.quit()
