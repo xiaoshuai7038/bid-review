@@ -1,0 +1,24 @@
+{
+  "name": "agent-worktree-dry-run",
+  "description": "Preview an isolated agent worktree without mutating the repository.",
+  "command": [
+    "powershell",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    "{workspace}/scripts/create-agent-worktree.ps1",
+    "-Name",
+    "demo-agent",
+    "-RootDir",
+    "{output_dir}/worktrees",
+    "-DryRun"
+  ],
+  "cwd": "{workspace}",
+  "assertions": {
+    "exit_code": 0,
+    "stdout_contains": [
+      "mode: dry-run",
+      "agent-env.ps1"
+    ]
+  }
+}

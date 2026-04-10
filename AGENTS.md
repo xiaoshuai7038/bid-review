@@ -1,19 +1,23 @@
 # AGENTS.md
 
 ## Purpose
-- This repository runs bid/tender compliance review by delegating analysis to local `claude` CLI.
+- This repository runs bid/tender compliance review by delegating analysis to Claude SDK runtime or OpenCode runtime.
 - Local code is responsible for orchestration and report export (`json`/`markdown`/`docx`), not rule reasoning.
 
 ## Environment
 - Python: `>=3.10`
 - Dependency/tooling: `uv`
-- External runtime dependency: local `claude` CLI must be installed and authenticated.
+- Authentication/runtime dependency: configure the required Claude/OpenCode credentials for the backend you use.
 
 ## Canonical Run Commands
 - Sync env:
   - `uv sync`
 - Show CLI help:
   - `uv run python -m app.main --help`
+- Default harness suite:
+  - `uv run python scripts/run_harness.py --output-dir "tmp/harness-full"`
+- Triage an existing run:
+  - `uv run python scripts/triage_run.py "data/output/run-*/"`
 - Main pipeline (PowerShell example):
   - `uv run python -m app.main --input "<tender>" --input "<bid>" --output-dir "data/output"`
 - Wrapper script:
@@ -35,6 +39,10 @@
 - `app/llm/`: Claude client + prompts.
 - `app/llm/prompts/`: prompt templates (`role_detect*`, `review_*`, `json_api_wrapper`).
 - `app/report/`: report exporters.
+- `app/harness/`: repo-native harness runner logic.
+- `docs/`: stable repository docs (`index`, `architecture`, `runtime-boundaries`, `harness`, `debugging`, `agent-workspaces`).
+- `harness/cases/`: machine-readable harness case definitions.
+- `harness/fixtures/`: offline sample run fixtures for triage and harness regression.
 - `data/output/`: run artifacts (`run-<timestamp>`), git-ignored.
 
 ## Change Rules For Agents
@@ -59,6 +67,8 @@
 ## Validation Checklist
 - Always run:
   - `uv run python -m app.main --help`
+- For repo-native harness changes:
+  - `uv run python scripts/run_harness.py --output-dir "tmp/harness-full"`
 - Run tests when available:
   - `uv run pytest -q`
 - If a task `contract.md` defines `Done When`, map each item to explicit validation before considering the task complete.
@@ -71,8 +81,14 @@
 
 ## Debugging Notes
 - On failures, inspect run directory under `data/output/run-*`.
+- For harness failures, inspect `tmp/harness-runs/run-*` or the explicit `--output-dir` and open `run_manifest.json`.
+- Prefer `uv run python scripts/triage_run.py "<run-dir-or-manifest>"` before manually opening every artifact.
 - `claude_raw_output.txt` is the primary source for parsing/format issues (unless `--no-raw-output` is used).
 - For role detection problems, start from `app/orchestrator.py` branching around manual/auto role selection.
+
+## Docs
+- Stable repo docs entrypoint:
+  - `docs/index.md`
 
 ## Out Of Scope
 - Re-implementing bid review reasoning locally (must stay Claude-driven).

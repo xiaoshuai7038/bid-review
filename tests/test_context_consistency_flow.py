@@ -126,6 +126,8 @@ def test_review_main_prompt_requires_field_level_template_checks() -> None:
     assert "模板字段完整性/字段角色一致性" in prompt
     assert "不得用“需人工核验主体一致性/项目信息一致性”替代" in prompt
     assert "投标保证金交纳证明、基本账户开户证明" in prompt
+    assert "受控运行目录" in prompt
+    assert "禁止使用 Bash 做目录扫描" in prompt
 
 
 def test_review_second_pass_prompt_requires_field_level_retry() -> None:
@@ -144,6 +146,8 @@ def test_review_second_pass_prompt_requires_field_level_retry() -> None:
     assert "第六章模板字段角色不匹配" in prompt
     assert "必须重新回到对应模板文书和字段位置核对" in prompt
     assert "禁止只输出“需人工核验”概括项" in prompt
+    assert "受控运行目录" in prompt
+    assert "禁止使用 Bash 做目录扫描" in prompt
 
 
 def test_run_bid_review_retries_when_review_completion_gate_fails(

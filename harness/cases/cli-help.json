@@ -1,0 +1,19 @@
+{
+  "name": "cli-help",
+  "description": "Verify that the main CLI help entrypoint remains executable.",
+  "command": [
+    "uv",
+    "run",
+    "python",
+    "-m",
+    "app.main",
+    "--help"
+  ],
+  "cwd": "{workspace}",
+  "assertions": {
+    "exit_code": 0,
+    "stdout_contains": [
+      "将招标/投标文件交给 Claude SDK 或 OpenCode SDK runtime 执行标书审查并输出报告。"
+    ]
+  }
+}

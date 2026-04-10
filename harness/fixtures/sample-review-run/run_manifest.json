@@ -1,0 +1,70 @@
+{
+  "kind": "review",
+  "schema_version": 1,
+  "run_id": "sample-review-run",
+  "output_dir": ".",
+  "started_at": "2026-04-10T13:10:00",
+  "completed_at": "2026-04-10T13:12:30",
+  "status": "completed",
+  "failed_stage": "",
+  "error": null,
+  "backend": {
+    "requested_backend": "claude",
+    "selected_backend": "claude",
+    "model": "claude-sonnet-4-5",
+    "opencode_model": "",
+    "effort": "medium",
+    "review_profile": "thorough",
+    "timeout_sec": 600,
+    "show_progress": true,
+    "progress_level": "agent"
+  },
+  "runtime": {
+    "requested_workspace": "D:/code/bidreview",
+    "effective_workspace": "D:/code/bidreview/.runtime/review-context/sample-review-run",
+    "run_context_root": "D:/code/bidreview/.runtime/review-context/sample-review-run",
+    "managed_runtime_enabled": false,
+    "mcp_config_source": "project-default"
+  },
+  "inputs": {
+    "requested_inputs": [
+      "samples/tender.pdf",
+      "samples/bid.docx"
+    ],
+    "explicit_tender_path": "samples/tender.pdf",
+    "explicit_bid_paths": [
+      "samples/bid.docx"
+    ],
+    "run_context_path_map": {
+      "samples/tender.pdf": ".runtime/review-context/sample-review-run/inputs/001/tender.pdf",
+      "samples/bid.docx": ".runtime/review-context/sample-review-run/inputs/002/bid.docx"
+    }
+  },
+  "selection": {
+    "role_reasoning": "manual",
+    "tender_path": "samples/tender.pdf",
+    "bid_paths": [
+      "samples/bid.docx"
+    ]
+  },
+  "runs": [
+    {
+      "index": 1,
+      "bid_path": "samples/bid.docx",
+      "tender_path": "samples/tender.pdf",
+      "isolated_bid_path": ".runtime/review-context/sample-review-run/inputs/002/bid.docx",
+      "isolated_tender_path": ".runtime/review-context/sample-review-run/inputs/001/tender.pdf",
+      "status": "completed",
+      "output_dir": "bid-001-demo",
+      "json": "bid-001-demo/review_result.json",
+      "markdown": "bid-001-demo/review_report.md",
+      "docx": "bid-001-demo/review_report.docx",
+      "claude_raw": "",
+      "run_metrics": "bid-001-demo/run_metrics.json",
+      "summary": {
+        "requirement_count": 3,
+        "finding_count": 1
+      }
+    }
+  ]
+}

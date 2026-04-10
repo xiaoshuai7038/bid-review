@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Verify Python sources compile
+        run: uv run python -m compileall app scripts tests
+
+      - name: Verify CLI help
+        run: uv run python -m app.main --help
+
+      - name: Run default harness suite
+        run: uv run python scripts/run_harness.py --output-dir tmp/ci-harness
+
+      - name: Run test suite
+        run: uv run pytest -q

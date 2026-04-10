@@ -1,0 +1,25 @@
+{
+  "name": "task-doc-scaffold",
+  "description": "Scaffold task docs into the harness output directory.",
+  "command": [
+    "uv",
+    "run",
+    "python",
+    "scripts/init_task_docs.py",
+    "{output_dir}/sample-task",
+    "--goal",
+    "Harness sample goal"
+  ],
+  "cwd": "{workspace}",
+  "assertions": {
+    "exit_code": 0,
+    "files_exist": [
+      "{output_dir}/sample-task/contract.md",
+      "{output_dir}/sample-task/plan.md",
+      "{output_dir}/sample-task/status.md",
+      "{output_dir}/sample-task/prompt.md",
+      "{output_dir}/sample-task/implement.md",
+      "{output_dir}/sample-task/documentation.md"
+    ]
+  }
+}

@@ -142,6 +142,15 @@ def default_ocr_temp_root() -> Path | None:
     return runtime_subdir("tmp", "ocr")
 
 
+def default_run_context_root() -> Path:
+    explicit = os.getenv(RUN_CONTEXT_DIR_ENV)
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    if managed_runtime_enabled():
+        return runtime_subdir("tmp", "review-context")
+    return (workspace_root() / "tmp" / "review-context").resolve()
+
+
 def default_claude_config_dir() -> Path | None:
     explicit = os.getenv(CLAUDE_CONFIG_DIR_ENV)
     if explicit:

@@ -2,6 +2,7 @@
 
 工作目录：
 - {{workspace_dir}}
+- 这是本次审查的受控运行目录，仅包含本次输入文件和本次运行生成的受控临时目录。
 
 目标文件（优先直接把这些绝对路径传给 MCP 工具，不要先用 Bash 到其他目录查找）：
 - 招标文件: {{tender_path}}
@@ -56,7 +57,7 @@
    - 若投标文件为 `.docx`，先调用 `document-parser.extract_images_from_word`，再调用 `paddle-ocr.ocr_images_in_dir` 对提取目录中的全部图片OCR。
    - 若投标文件为 `.pdf` 且含图片页，调用 `paddle-ocr.ocr_pdf` 完成逐页图片OCR。
 17) 只能使用已配置的 PDF/Word/OCR MCP 工具读取文档，禁止自行编写或运行 Python/PowerShell/Bash 脚本解析文档。
-18) 允许 Bash 仅做极少量只读定位（`ls` / `find` / `rg` / `cat` / `head` / `tail`），禁止任何写操作（如重定向、`tee`、`Out-File`、`Set-Content`、`touch`、`mkdir`、`mv`、`cp`、`rm` 等）。禁止围绕 tool-results 文件长期 grep/sed/awk 作为主阅读路径。
+18) 禁止使用 Bash 做目录扫描、文件发现或通配搜索（如 `ls` / `dir` / `find` / `rg` / `glob`）；禁止通过目录枚举寻找其他“可能相关”的文件。仅当某个工具已经返回本次运行生成的受控临时文件/目录的绝对路径时，才允许对该单个已知路径做极少量只读 `cat` / `head` / `tail`；禁止任何写操作（如重定向、`tee`、`Out-File`、`Set-Content`、`touch`、`mkdir`、`mv`、`cp`、`rm` 等）。禁止围绕 tool-results 文件长期 grep/sed/awk 作为主阅读路径。
 19) 禁止把中间结果写入任何本地文件，不得生成 `txt/json/py/log` 等调试产物。
 20) 禁止以“时间不够/时间有限/来不及”等理由跳过分析或输出相关措辞。
 21) 上下文控制：禁止粘贴整份文档全文、超长表格或超长路径列表；仅保留与新增发现项直接相关的短证据片段。

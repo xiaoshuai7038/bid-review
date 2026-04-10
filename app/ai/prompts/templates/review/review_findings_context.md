@@ -2,6 +2,7 @@
 
 工作目录：
 - {{workspace_dir}}
+- 这是本次审查的受控运行目录，仅包含本次输入文件和本次运行生成的受控临时目录。
 
 目标文件：
 - 招标文件: {{tender_path}}
@@ -45,7 +46,7 @@ OCR 预处理状态（由编排层提供，若非“无”则必须复用，不�
    - `paddle-ocr.ocr_images_in_dir`
    如确需核对单张图片，只允许对上方受控临时目录中的具体图片调用 `paddle-ocr.ocr_image`。
 9. 证据必须精确到行级。
-10. 允许 Bash 仅做极少量只读定位，禁止写操作。
+10. 禁止使用 Bash 做目录扫描、文件发现或通配搜索（如 `ls` / `dir` / `find` / `rg` / `glob`）；禁止通过目录枚举寻找其他文件。仅当某个工具已经返回本次运行生成的受控临时文件/目录的绝对路径时，才允许对该单个已知路径做极少量只读 `cat` / `head` / `tail`，禁止任何写操作。
 11. 在 `summary.review_scope` 中如实返回：
    - `tender_total_pages_seen`
    - `tender_sections_reviewed`

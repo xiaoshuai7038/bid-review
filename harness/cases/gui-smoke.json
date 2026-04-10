@@ -1,0 +1,24 @@
+{
+  "name": "gui-smoke",
+  "description": "Launch the desktop GUI in smoke-test mode and save a screenshot.",
+  "command": [
+    "uv",
+    "run",
+    "python",
+    "-m",
+    "app.gui.main",
+    "--smoke-test",
+    "--screenshot",
+    "{output_dir}/gui-smoke.png"
+  ],
+  "cwd": "{workspace}",
+  "env": {
+    "QT_QPA_PLATFORM": "offscreen"
+  },
+  "assertions": {
+    "exit_code": 0,
+    "files_exist": [
+      "{output_dir}/gui-smoke.png"
+    ]
+  }
+}

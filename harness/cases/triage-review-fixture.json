@@ -1,0 +1,20 @@
+{
+  "name": "triage-review-fixture",
+  "description": "Summarize the sample review fixture in text mode.",
+  "command": [
+    "uv",
+    "run",
+    "python",
+    "scripts/triage_run.py",
+    "harness/fixtures/sample-review-run"
+  ],
+  "cwd": "{workspace}",
+  "assertions": {
+    "exit_code": 0,
+    "stdout_contains": [
+      "kind: review",
+      "backend: claude",
+      "missing_artifact_count: 1"
+    ]
+  }
+}

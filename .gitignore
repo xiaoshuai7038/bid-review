@@ -5,7 +5,6 @@ __pycache__/
 *.egg-info/
 data/output/
 data/input/
-docs/
 build/
 dist/
 BidReviewDesktopDebug.spec

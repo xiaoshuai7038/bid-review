@@ -1,0 +1,22 @@
+{
+  "name": "triage-harness-fixture",
+  "description": "Summarize the sample harness fixture in JSON mode.",
+  "command": [
+    "uv",
+    "run",
+    "python",
+    "scripts/triage_run.py",
+    "harness/fixtures/sample-harness-run",
+    "--format",
+    "json"
+  ],
+  "cwd": "{workspace}",
+  "assertions": {
+    "exit_code": 0,
+    "stdout_contains": [
+      "\"kind\": \"harness\"",
+      "\"failed_count\": 1",
+      "\"gui-smoke\""
+    ]
+  }
+}

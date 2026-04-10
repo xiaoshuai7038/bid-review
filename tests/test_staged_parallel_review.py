@@ -136,12 +136,20 @@ def test_stage_prompts_split_requirements_main_context_and_semantic_roles() -> N
     )
 
     assert "不要审查投标文件，不要输出 findings" in requirements_prompt
+    assert "受控运行目录" in requirements_prompt
+    assert "禁止使用 Bash 做目录扫描" in requirements_prompt
     assert "严格边界" in main_prompt
     assert "禁止再次调用" in main_prompt
+    assert "受控运行目录" in main_prompt
+    assert "禁止使用 Bash 做目录扫描" in main_prompt
     assert "本阶段必须覆盖两类问题" in context_prompt
     assert "仅仅是字段语义类型错误" in context_prompt
+    assert "受控运行目录" in context_prompt
+    assert "禁止使用 Bash 做目录扫描" in context_prompt
     assert "字段标题和值的语义类型是否匹配" in semantic_prompt
     assert "如果字段期待“公司名”，实际也填了“公司名”，只是公司错了" in semantic_prompt
+    assert "受控运行目录" in semantic_prompt
+    assert "禁止使用 Bash 做目录扫描" in semantic_prompt
 
 
 def test_stage_empty_output_retries_with_explicit_json_instruction() -> None:

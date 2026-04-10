@@ -22,6 +22,31 @@
 
 `app/review/workflows/` 提供 review workflow 的分类入口；`app/review/claude_review.py` 当前保留为 legacy compatibility shim。
 
+## 仓库文档与 Harness
+
+仓库内稳定文档入口：
+
+- `docs/index.md`
+- `docs/architecture.md`
+- `docs/runtime-boundaries.md`
+- `docs/harness.md`
+- `docs/debugging.md`
+- `docs/agent-workspaces.md`
+
+基础 harness 入口：
+
+```powershell
+uv run python scripts/run_harness.py --output-dir "tmp/harness-full"
+```
+
+当前默认 harness 只包含离线 case，用于验证仓库入口、GUI smoke、triage、task docs 和 agent workspace 辅助，不依赖在线模型凭证。
+
+单次 triage 入口：
+
+```powershell
+uv run python scripts/triage_run.py "data/output/run-20260410-130000"
+```
+
 ## 运行
 
 先同步环境：
