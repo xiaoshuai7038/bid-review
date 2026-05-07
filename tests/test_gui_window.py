@@ -5,19 +5,36 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from PySide6.QtCore import QUrl
-from PySide6.QtWidgets import QSizePolicy
+from PySide6.QtCore import QPoint, QPointF, Qt, QUrl
+from PySide6.QtGui import QWheelEvent
+from PySide6.QtWidgets import QApplication, QSizePolicy
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from app.gui.app import create_application
-from app.gui.window import MainWindow, MultiFileDropCard, SingleFileDropCard
+from app.gui.services import BatchReviewData, ReviewRunData
+from app.gui.window import FindingsTableDelegate, MainWindow, MultiFileDropCard, SingleFileDropCard
 
 
 def _set_combo_to_value(combo, value: str) -> None:
     index = combo.findData(value)
     assert index >= 0
     combo.setCurrentIndex(index)
+
+
+def _send_mouse_wheel(widget) -> None:
+    center = widget.rect().center()
+    event = QWheelEvent(
+        QPointF(center),
+        QPointF(widget.mapToGlobal(center)),
+        QPoint(0, 0),
+        QPoint(0, 120),
+        Qt.NoButton,
+        Qt.NoModifier,
+        Qt.ScrollUpdate,
+        False,
+    )
+    QApplication.sendEvent(widget, event)
 
 
 def test_main_window_boots_with_saved_settings(tmp_path: Path, monkeypatch) -> None:
@@ -196,6 +213,95 @@ def test_settings_page_form_controls_keep_usable_height(tmp_path: Path, monkeypa
     app.processEvents()
     assert page.backend_stack.currentIndex() == 1
     assert page.backend_section_title.text() == "OpenCode 默认设置"
+
+    window.close()
+    app.quit()
+
+
+def test_config_dropdowns_ignore_mouse_wheel_changes(tmp_path: Path, monkeypatch) -> None:
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "default_backend": "claude",
+                "default_output_dir": str(tmp_path / "output"),
+                "default_progress_level": "agent",
+                "default_timeout_sec": 1800,
+                "default_effort": "medium",
+                "default_review_profile": "balanced",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BID_REVIEW_GUI_SETTINGS_PATH", str(settings_path))
+
+    app = create_application([])
+    window = MainWindow()
+    window.show()
+    window._set_current_page(1)
+    app.processEvents()
+
+    review_page = window.review_page
+
+    review_backend_before = review_page.backend_combo.currentData()
+    review_timeout_before = review_page.timeout_spin.value()
+
+    review_page.backend_combo.setFocus()
+    review_page.timeout_spin.setFocus()
+
+    _send_mouse_wheel(review_page.backend_combo)
+    _send_mouse_wheel(review_page.timeout_spin)
+    app.processEvents()
+
+    assert review_page.backend_combo.currentData() == review_backend_before
+    assert review_page.timeout_spin.value() == review_timeout_before
+
+    window._set_current_page(3)
+    app.processEvents()
+
+    settings_page = window.settings_page
+    settings_progress_before = settings_page.default_progress.currentData()
+    settings_timeout_before = settings_page.default_timeout.value()
+
+    settings_page.default_progress.setFocus()
+    settings_page.default_timeout.setFocus()
+
+    _send_mouse_wheel(settings_page.default_progress)
+    _send_mouse_wheel(settings_page.default_timeout)
+    app.processEvents()
+
+    assert settings_page.default_progress.currentData() == settings_progress_before
+    assert settings_page.default_timeout.value() == settings_timeout_before
+
+    window.close()
+    app.quit()
+
+
+def test_custom_timeout_from_saved_settings_stays_selectable(tmp_path: Path, monkeypatch) -> None:
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "default_backend": "claude",
+                "default_output_dir": str(tmp_path / "output"),
+                "default_timeout_sec": 1020,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BID_REVIEW_GUI_SETTINGS_PATH", str(settings_path))
+
+    app = create_application([])
+    window = MainWindow()
+    window.show()
+    app.processEvents()
+
+    assert window.review_page.timeout_spin.value() == 1020
+    assert window.settings_page.default_timeout.value() == 1020
+    assert window.review_page.timeout_spin.currentData() == 1020
+    assert window.settings_page.default_timeout.currentData() == 1020
 
     window.close()
     app.quit()
@@ -437,14 +543,107 @@ def test_results_page_uses_user_friendly_labels(tmp_path: Path, monkeypatch) -> 
     app.processEvents()
 
     page = window.results_page
+    assert window.page_title.text() == "查看结果"
+    assert window.page_subtitle.isVisible() is False
     assert page.tender_label.text() == "尚未加载审查结果"
     assert page.open_output_button.text() == "打开结果目录"
     assert page.open_json_button.text() == "打开结构化结果"
     assert page.open_md_button.text() == "打开文本报告"
     assert page.open_docx_button.text() == "打开 Word 报告"
     assert page.open_batch_button.text() == "打开批量汇总"
+    assert page.summary_card.isVisible()
+    assert page.run_combo.maximumWidth() == 460
+    assert isinstance(page.findings_table.itemDelegate(), FindingsTableDelegate)
     headers = [page.findings_table.horizontalHeaderItem(i).text() for i in range(page.findings_table.columnCount())]
     assert headers == ["编号", "条款编号", "结论", "问题说明", "招标依据", "投标依据", "处理建议"]
+
+    window.close()
+    app.quit()
+
+
+def test_results_page_findings_table_reflows_rows_and_top_aligns_text(tmp_path: Path, monkeypatch) -> None:
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "default_backend": "claude",
+                "default_output_dir": str(tmp_path / "output"),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BID_REVIEW_GUI_SETTINGS_PATH", str(settings_path))
+
+    report = {
+        "summary": {
+            "requirement_count": 2,
+            "non_compliant_count": 1,
+            "risk_count": 1,
+            "needs_manual_count": 0,
+        },
+        "findings": [
+            {
+                "id": "F001",
+                "requirement_id": "R003",
+                "status": "non_compliant",
+                "issue": "投标文件未提供项目负责人近一年本企业缴纳的社保证明。",
+                "tender_evidence": "招标文件第10页 L31：项目负责人具有近一年本企业缴纳的社保证明。",
+                "bid_evidence": "投标文件《项目实施团队人员配置》L4-L6：项目负责人-张春艳，社保证明未提供。",
+                "recommendation": "立即补充项目负责人近一年社保证明。"
+            },
+            {
+                "id": "F002",
+                "requirement_id": "R004",
+                "status": "risk",
+                "issue": "投标文件未提供中国裁判文书网查询截图。该问题说明文本更长，用来触发行高重算。",
+                "tender_evidence": "招标文件第10页 L32-L34：投标人及其法定代表人、主要负责人截至目前三年内无行贿行为记录的中国裁判文书网上查询结果截图。",
+                "bid_evidence": "投标文件《关于行贿等黑名单行为的专项承诺函》L1-L4：仅作出承诺，未附查询结果截图。",
+                "recommendation": "立即登录中国裁判文书网，查询并截取完整结果页面作为附件。"
+            },
+        ],
+    }
+    run = ReviewRunData(
+        bid_path=str(tmp_path / "投标文件.docx"),
+        output_dir=tmp_path,
+        json_path=tmp_path / "review_report.json",
+        markdown_path=tmp_path / "review_report.md",
+        docx_path=tmp_path / "review_report.docx",
+        raw_output_path=None,
+        summary=report["summary"],
+        report=report,
+    )
+    batch = BatchReviewData(
+        tender_path=str(tmp_path / "招标文件.pdf"),
+        role_reasoning="manual",
+        output_dir=tmp_path,
+        batch_summary_path=tmp_path / "batch_summary.json",
+        runs=[run],
+    )
+
+    app = create_application([])
+    window = MainWindow()
+    window.resize(1600, 980)
+    window.show()
+    window.results_page.set_result(batch)
+    window._set_current_page(2)
+    app.processEvents()
+
+    page = window.results_page
+    first_height = page.findings_table.rowHeight(0)
+    second_height = page.findings_table.rowHeight(1)
+    assert first_height > 0
+    assert second_height >= first_height
+    assert page.findings_table.item(0, 3).textAlignment() & Qt.AlignTop
+    assert page.findings_table.item(0, 4).textAlignment() & Qt.AlignTop
+    wide_height = second_height
+
+    window.resize(1240, 900)
+    app.processEvents()
+    app.processEvents()
+
+    narrow_height = page.findings_table.rowHeight(1)
+    assert narrow_height >= wide_height
 
     window.close()
     app.quit()

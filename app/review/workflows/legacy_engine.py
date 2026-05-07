@@ -3289,7 +3289,7 @@ def _parse_review_report_from_raw(
     bid_path: Path,
 ) -> tuple[dict[str, Any], str]:
     try:
-        data = extract_json_payload(raw_output)
+        data = extract_json_payload(raw_output, required_top_keys=["requirements", "findings", "summary"])
     except Exception as exc:  # noqa: BLE001
         repaired = None
         if hasattr(client, "repair_json_text"):
@@ -3596,7 +3596,10 @@ def _run_bid_review_single_session(
             )
             report = _apply_observed_scope_to_report(report, observed_scope)
             if policy.enable_completion_retry and _completion_gate_enabled():
-                raw_data = extract_json_payload(raw_output)
+                raw_data = extract_json_payload(
+                    raw_output,
+                    required_top_keys=["requirements", "findings", "summary"],
+                )
                 raw_data = _merge_review_scope_with_observed(raw_data, observed_scope)
                 completion_failures = _evaluate_review_completion(
                     raw_data,
@@ -3645,7 +3648,10 @@ def _run_bid_review_single_session(
                         guard_state=retry_guard_state,
                     )
                     report = _apply_observed_scope_to_report(report, observed_scope)
-                    raw_data = extract_json_payload(completion_retry_raw)
+                    raw_data = extract_json_payload(
+                        completion_retry_raw,
+                        required_top_keys=["requirements", "findings", "summary"],
+                    )
                     raw_data = _merge_review_scope_with_observed(raw_data, observed_scope)
                     retry_completion_failures = _evaluate_review_completion(
                         raw_data,
@@ -3758,7 +3764,7 @@ def _run_bid_review_single_session(
             if _has_forbidden_write_tool_call(client.get_last_tool_uses()) and _strict_fail_on_forbidden_write():
                 raise ClaudeCallError("二次复核阶段检测到写文件/脚本执行行为，已按只读规则重试1次仍失败。")
     try:
-        second_data = extract_json_payload(second_raw)
+        second_data = extract_json_payload(second_raw, required_top_keys=["additional_findings"])
         add_findings = _normalize_findings(second_data.get("additional_findings", []))
     except Exception:  # noqa: BLE001
         add_findings = []
@@ -3833,7 +3839,7 @@ def _parse_stage_json_output(
     task_label: str,
 ) -> tuple[dict[str, Any], str]:
     try:
-        data = extract_json_payload(raw_output)
+        data = extract_json_payload(raw_output, required_top_keys=required_top_keys)
     except Exception as exc:  # noqa: BLE001
         repaired = None
         if hasattr(client, "repair_json_text"):
@@ -4530,7 +4536,7 @@ def _run_bid_review_staged(
                 if _has_forbidden_write_tool_call(client.get_last_tool_uses()) and _strict_fail_on_forbidden_write():
                     raise ClaudeCallError("二次复核阶段检测到写文件/脚本执行行为，已按只读规则重试1次仍失败。")
         try:
-            second_data = extract_json_payload(second_raw)
+            second_data = extract_json_payload(second_raw, required_top_keys=["additional_findings"])
             add_findings = _normalize_findings(second_data.get("additional_findings", []))
         except Exception:  # noqa: BLE001
             add_findings = []

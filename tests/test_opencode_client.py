@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from app.ai.core.json_output import extract_json_payload
 from app.llm.opencode_client import OpenCodeCallError, OpenCodeClient
 
 
@@ -83,6 +84,104 @@ def test_opencode_parse_invalid_json_output_fails(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(client, "ask_text", lambda *args, **kwargs: "not-json")
     with pytest.raises(OpenCodeCallError, match="JSON解析失败"):
         client.ask_json("仅用于测试", required_top_keys=["requirements"], max_retries=0)
+
+
+def test_extract_json_payload_prefers_candidate_with_required_keys() -> None:
+    raw = """
+你是JSON API。只输出一个JSON对象或JSON数组，不要markdown，不要解释，不要前后缀。
+如果无法完成，输出 {"error": "..."}。
+
+{"requirements":[{"id":"R001"}],"summary":{"requirement_count":1}}
+"""
+    data = extract_json_payload(raw, required_top_keys=["requirements", "summary"])
+    assert data["requirements"][0]["id"] == "R001"
+    assert data["summary"]["requirement_count"] == 1
+
+
+def test_opencode_ask_json_ignores_prompt_echoed_error_example(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = OpenCodeClient(show_progress=False)
+    monkeypatch.setattr(
+        client,
+        "ask_text",
+        lambda *args, **kwargs: """
+你是JSON API。只输出一个JSON对象或JSON数组，不要markdown，不要解释，不要前后缀。
+如果无法完成，输出 {"error": "..."}。
+
+{"requirements":[{"id":"R001"}],"summary":{"requirement_count":1}}
+""",
+    )
+
+    data = client.ask_json(
+        "仅用于测试",
+        required_top_keys=["requirements", "summary"],
+        max_retries=0,
+    )
+
+    assert data["requirements"][0]["id"] == "R001"
+    assert data["summary"]["requirement_count"] == 1
+
+
+def test_opencode_ask_json_accepts_python_literal_without_model_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = OpenCodeClient(show_progress=False)
+    monkeypatch.setattr(
+        client,
+        "ask_text",
+        lambda *args, **kwargs: (
+            "{'requirements': [{'id': 'R001', 'text': 'a', 'source': 'b'}], "
+            "'summary': {'requirement_count': 1},}"
+        ),
+    )
+
+    data = client.ask_json(
+        "仅用于测试",
+        required_top_keys=["requirements", "summary"],
+        max_retries=0,
+    )
+
+    assert data["requirements"][0]["source"] == "b"
+    assert data["summary"]["requirement_count"] == 1
+
+
+def test_opencode_ask_json_unwraps_embedded_content_json_string(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = OpenCodeClient(show_progress=False)
+    monkeypatch.setattr(
+        client,
+        "ask_text",
+        lambda *args, **kwargs: (
+            r'{"content":"{\"requirements\":[{\"id\":\"R001\",\"text\":\"a\",\"source\":\"b\"}],'
+            r'\"summary\":{\"requirement_count\":1}}"}'
+        ),
+    )
+
+    data = client.ask_json(
+        "仅用于测试",
+        required_top_keys=["requirements", "summary"],
+        max_retries=0,
+    )
+
+    assert data["requirements"][0]["id"] == "R001"
+    assert data["summary"]["requirement_count"] == 1
+
+
+def test_opencode_ask_json_repairs_invalid_json_before_retrying_original_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = OpenCodeClient(show_progress=False)
+    responses = iter(
+        [
+            '{"requirements":[{"id":"R001","text":"a" "source":"b"}],"summary":{}}',
+            '{"requirements":[{"id":"R001","text":"a","source":"b"}],"summary":{"requirement_count":1}}',
+        ]
+    )
+
+    monkeypatch.setattr(client, "ask_text", lambda *args, **kwargs: next(responses))
+
+    data = client.ask_json(
+        "仅用于测试",
+        required_top_keys=["requirements", "summary"],
+        max_retries=0,
+    )
+
+    assert data["requirements"][0]["source"] == "b"
+    assert data["summary"]["requirement_count"] == 1
 
 
 def test_opencode_base_cmd_omits_model_when_unspecified() -> None:

@@ -4,6 +4,7 @@ import io
 from pathlib import Path
 from types import SimpleNamespace
 
+from app.ai.core.json_output import extract_json_payload
 from app.llm.claude_client import ClaudeCallError, _contains_timeout, _exception_detail
 from app.llm.claude_client import ClaudeClient, _patch_sdk_windows_hidden_cli_spawn
 
@@ -127,6 +128,84 @@ def test_ask_json_repairs_invalid_json_before_retrying_original_prompt(monkeypat
 
     assert isinstance(data, dict)
     assert list(data.keys()) == ["requirements", "findings", "summary"]
+
+
+def test_claude_extract_json_payload_prefers_required_keys_over_prompt_echo() -> None:
+    raw = """
+你是JSON API。只输出一个JSON对象或JSON数组，不要markdown，不要解释，不要前后缀。
+如果无法完成，输出 {"error": "..."}。
+
+{"requirements":[{"id":"R001"}],"findings":[],"summary":{"requirement_count":1}}
+"""
+    data = extract_json_payload(raw, required_top_keys=["requirements", "findings", "summary"])
+
+    assert data["requirements"][0]["id"] == "R001"
+    assert data["summary"]["requirement_count"] == 1
+
+
+def test_extract_json_payload_accepts_python_literal_dict() -> None:
+    raw = """
+结果如下：
+{'requirements': [{'id': 'R001', 'text': '投标函应按格式填写', 'source': 's'}], 'findings': [], 'summary': {'requirement_count': 1, 'finding_count': 0},}
+"""
+    data = extract_json_payload(raw, required_top_keys=["requirements", "findings", "summary"])
+
+    assert data["requirements"][0]["id"] == "R001"
+    assert data["summary"]["finding_count"] == 0
+
+
+def test_extract_json_payload_unwraps_embedded_result_json_string() -> None:
+    raw = r'{"result":"{\"requirements\":[{\"id\":\"R001\",\"text\":\"a\",\"source\":\"b\"}],\"findings\":[],\"summary\":{\"requirement_count\":1}}"}'
+    data = extract_json_payload(raw, required_top_keys=["requirements", "findings", "summary"])
+
+    assert data["requirements"][0]["source"] == "b"
+    assert data["summary"]["requirement_count"] == 1
+
+
+def test_claude_ask_json_accepts_python_literal_without_model_repair(monkeypatch) -> None:
+    client = ClaudeClient(show_progress=False)
+
+    monkeypatch.setattr(
+        ClaudeClient,
+        "ask_text",
+        lambda self, prompt, task_label=None: (
+            "{'requirements': [{'id': 'R001', 'text': 'a', 'source': 'b'}], "
+            "'findings': [], 'summary': {'requirement_count': 1, 'finding_count': 0},}"
+        ),
+    )
+
+    data = client.ask_json(
+        "返回审查结果",
+        required_top_keys=["requirements", "findings", "summary"],
+        max_retries=0,
+        task_label="单测",
+    )
+
+    assert data["requirements"][0]["source"] == "b"
+    assert data["summary"]["requirement_count"] == 1
+
+
+def test_claude_ask_json_unwraps_embedded_content_json_string(monkeypatch) -> None:
+    client = ClaudeClient(show_progress=False)
+
+    monkeypatch.setattr(
+        ClaudeClient,
+        "ask_text",
+        lambda self, prompt, task_label=None: (
+            r'{"content":"{\"requirements\":[{\"id\":\"R001\",\"text\":\"a\",\"source\":\"b\"}],'
+            r'\"findings\":[],\"summary\":{\"requirement_count\":1,\"finding_count\":0}}"}'
+        ),
+    )
+
+    data = client.ask_json(
+        "返回审查结果",
+        required_top_keys=["requirements", "findings", "summary"],
+        max_retries=0,
+        task_label="单测",
+    )
+
+    assert data["requirements"][0]["id"] == "R001"
+    assert data["summary"]["finding_count"] == 0
 
 
 def test_repair_json_text_requires_top_keys(monkeypatch) -> None:

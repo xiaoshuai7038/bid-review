@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib
 import importlib.util
 import json
@@ -81,18 +82,231 @@ class Phase(str, Enum):
         }.get(self, 2)
 
 
-def extract_json_payload(text: str) -> Any:
+def _strip_json_code_fences(text: str) -> str:
     cleaned = text.strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def _collect_json_candidates(text: str) -> list[tuple[Any, int, int]]:
+    decoder = json.JSONDecoder()
+    candidates: list[tuple[Any, int, int]] = []
+    for start, ch in enumerate(text):
+        if ch not in "[{":
+            continue
+        try:
+            payload, end = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            continue
+        candidates.append((payload, start, start + end))
+    return candidates
+
+
+def _iter_balanced_json_like_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    pairs = {"{": "}", "[": "]"}
+    for start, ch in enumerate(text):
+        if ch not in pairs:
+            continue
+        stack = [ch]
+        in_string: str | None = None
+        escaped = False
+        for idx in range(start + 1, len(text)):
+            current = text[idx]
+            if in_string is not None:
+                if escaped:
+                    escaped = False
+                    continue
+                if current == "\\":
+                    escaped = True
+                    continue
+                if current == in_string:
+                    in_string = None
+                continue
+            if current in {'"', "'"}:
+                in_string = current
+                continue
+            if current in pairs:
+                stack.append(current)
+                continue
+            if current in "}]" and stack:
+                expected = pairs[stack[-1]]
+                if current != expected:
+                    break
+                stack.pop()
+                if not stack:
+                    spans.append((start, idx + 1))
+                    break
+    return spans
+
+
+def _collect_python_literal_candidates(text: str) -> list[tuple[Any, int, int]]:
+    candidates: list[tuple[Any, int, int]] = []
+    seen_spans: set[tuple[int, int]] = set()
+    for start, end in _iter_balanced_json_like_spans(text):
+        span = (start, end)
+        if span in seen_spans:
+            continue
+        seen_spans.add(span)
+        segment = text[start:end]
+        try:
+            payload = ast.literal_eval(segment)
+        except Exception:
+            continue
+        if isinstance(payload, (dict, list)):
+            candidates.append((payload, start, end))
+    return candidates
+
+
+def _json_required_key_score(payload: Any, required_top_keys: list[str] | None) -> tuple[int, int]:
+    if not required_top_keys or not isinstance(payload, dict):
+        return 0, 0
+    matched = sum(1 for key in required_top_keys if key in payload)
+    return int(matched == len(required_top_keys)), matched
+
+
+def _missing_required_top_keys(payload: Any, required_top_keys: list[str] | None) -> list[str]:
+    if not required_top_keys or not isinstance(payload, dict):
+        return []
+    return [key for key in required_top_keys if key not in payload]
+
+
+def _payload_has_required_top_keys(payload: Any, required_top_keys: list[str] | None) -> bool:
+    if not required_top_keys:
+        return True
+    return isinstance(payload, dict) and all(key in payload for key in required_top_keys)
+
+
+def _try_extract_embedded_payload(
+    payload: Any,
+    *,
+    required_top_keys: list[str] | None,
+    unwrap_depth: int,
+) -> Any | None:
+    if unwrap_depth <= 0:
+        return None
+    if _payload_has_required_top_keys(payload, required_top_keys):
+        return payload
+
+    values: list[Any] = []
+    if isinstance(payload, str):
+        values = [payload]
+    elif isinstance(payload, dict):
+        preferred_keys = ("text", "output", "result", "content", "response", "data", "message", "payload")
+        for key in preferred_keys:
+            if key in payload:
+                values.append(payload[key])
+        for key, value in payload.items():
+            if key not in preferred_keys:
+                values.append(value)
+    elif isinstance(payload, list):
+        values = list(payload)
+    else:
+        return None
+
+    for value in values:
+        if value is payload:
+            continue
+        try:
+            if isinstance(value, str):
+                extracted = extract_json_payload(
+                    value,
+                    required_top_keys=required_top_keys,
+                    unwrap_depth=unwrap_depth - 1,
+                )
+            else:
+                extracted = _try_extract_embedded_payload(
+                    value,
+                    required_top_keys=required_top_keys,
+                    unwrap_depth=unwrap_depth - 1,
+                )
+        except Exception:
+            continue
+        if _payload_has_required_top_keys(extracted, required_top_keys):
+            return extracted
+    return None
+
+
+def extract_json_payload(
+    text: str,
+    *,
+    required_top_keys: list[str] | None = None,
+    unwrap_depth: int = 2,
+) -> Any:
+    cleaned = _strip_json_code_fences(text)
     try:
-        return json.loads(cleaned)
+        payload = json.loads(cleaned)
     except json.JSONDecodeError:
-        pass
-    match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", cleaned)
-    if not match:
+        try:
+            payload = ast.literal_eval(cleaned)
+        except Exception:
+            payload = None
+        if isinstance(payload, (dict, list)):
+            if _payload_has_required_top_keys(payload, required_top_keys):
+                return payload
+            embedded = _try_extract_embedded_payload(
+                payload,
+                required_top_keys=required_top_keys,
+                unwrap_depth=unwrap_depth,
+            )
+            if embedded is not None:
+                return embedded
+    else:
+        if _payload_has_required_top_keys(payload, required_top_keys):
+            return payload
+        embedded = _try_extract_embedded_payload(
+            payload,
+            required_top_keys=required_top_keys,
+            unwrap_depth=unwrap_depth,
+        )
+        if embedded is not None:
+            return embedded
+
+    candidates = _collect_json_candidates(cleaned) + _collect_python_literal_candidates(cleaned)
+    if not candidates:
         raise ClaudeCallError(f"未找到 JSON 结构，原始输出: {text[:500]}")
-    return json.loads(match.group(1))
+
+    if required_top_keys:
+        exact_matches: list[tuple[Any, int, int]] = []
+        for payload, start, end in candidates:
+            normalized = payload
+            if not _payload_has_required_top_keys(normalized, required_top_keys):
+                embedded = _try_extract_embedded_payload(
+                    normalized,
+                    required_top_keys=required_top_keys,
+                    unwrap_depth=unwrap_depth,
+                )
+                if embedded is None:
+                    continue
+                normalized = embedded
+            exact_matches.append((normalized, start, end))
+        if not exact_matches:
+            best_dict_candidate = None
+            dict_candidates = [item for item in candidates if isinstance(item[0], dict)]
+            if dict_candidates:
+                best_dict_candidate, _, _ = max(
+                    dict_candidates,
+                    key=lambda item: _json_required_key_score(item[0], required_top_keys),
+                )
+            if best_dict_candidate is not None:
+                missing = _missing_required_top_keys(best_dict_candidate, required_top_keys)
+                if missing:
+                    raise ClaudeCallError(f"缺少字段: {missing}")
+            raise ClaudeCallError(
+                "未找到包含必需顶层字段的 JSON 结构，"
+                f"required_top_keys={required_top_keys}，原始输出: {text[:500]}"
+            )
+        candidates = exact_matches
+
+    def _candidate_score(item: tuple[Any, int, int]) -> tuple[int, int, int, int]:
+        payload, start, end = item
+        exact_match, matched_keys = _json_required_key_score(payload, required_top_keys)
+        span = end - start
+        return exact_match, matched_keys, span, start
+
+    selected, _, _ = max(candidates, key=_candidate_score)
+    return selected
 
 
 def _exception_detail(exc: BaseException) -> str:
@@ -779,7 +993,7 @@ class ClaudeClient:
         for _ in range(max_retries + 1):
             raw = self.ask_text(full_prompt, task_label=task_label)
             try:
-                data = extract_json_payload(raw)
+                data = extract_json_payload(raw, required_top_keys=required_top_keys)
                 self._validate_json_top_keys(data, required_top_keys)
                 return data
             except Exception as exc:  # noqa: BLE001
@@ -822,7 +1036,7 @@ class ClaudeClient:
             repair_prompt,
             task_label=(f"{task_label}(JSON修复)" if task_label else "JSON修复"),
         )
-        data = extract_json_payload(repaired_raw)
+        data = extract_json_payload(repaired_raw, required_top_keys=required_top_keys)
         self._validate_json_top_keys(data, required_top_keys)
         return data
 

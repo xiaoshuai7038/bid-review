@@ -40,6 +40,14 @@ class OpenCodeCallError(RuntimeError):
     pass
 
 
+def _compact_text_for_prompt(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    head = text[: int(max_chars * 0.65)]
+    tail = text[-int(max_chars * 0.35) :]
+    return f"{head}\n\n...[TRUNCATED]...\n\n{tail}"
+
+
 @dataclass
 class OpenCodeClient:
     opencode_bin: str | None = None
@@ -1098,7 +1106,7 @@ class OpenCodeClient:
         for _ in range(max_retries + 1):
             raw = self.ask_text(full_prompt, task_label=task_label)
             try:
-                data = extract_json_payload(raw)
+                data = extract_json_payload(raw, required_top_keys=required_top_keys)
                 if isinstance(data, dict):
                     missing = [k for k in required_top_keys if k not in data]
                     if missing:
@@ -1106,7 +1114,50 @@ class OpenCodeClient:
                 return data
             except Exception as exc:  # noqa: BLE001
                 last_error = f"{type(exc).__name__}: {exc}"
+                try:
+                    data = self.repair_json_text(
+                        raw,
+                        required_top_keys=required_top_keys,
+                        parse_error=last_error,
+                        task_label=task_label,
+                    )
+                    return data
+                except Exception as repair_exc:  # noqa: BLE001
+                    last_error = f"{last_error}; repair_failed={type(repair_exc).__name__}: {repair_exc}"
         raise OpenCodeCallError(f"JSON解析失败: {last_error}")
+
+    def repair_json_text(
+        self,
+        raw_text: str,
+        *,
+        required_top_keys: list[str] | None = None,
+        parse_error: str = "",
+        task_label: str | None = None,
+    ) -> dict[str, Any] | list[Any]:
+        required_top_keys = required_top_keys or []
+        required_keys_text = "、".join(required_top_keys) if required_top_keys else "无强制字段要求"
+        repair_prompt = (
+            "下面是一段本应为合法JSON的模型输出，但它当前不是严格合法的JSON。\n"
+            "请在不改变原始语义的前提下，将它修复成一个严格合法的JSON对象或JSON数组。\n"
+            "要求：\n"
+            "1. 只输出JSON，不要markdown，不要解释，不要前后缀。\n"
+            "2. 不要删减已有字段，除非该字段本身语法残缺到无法保留。\n"
+            f"3. 若输出为JSON对象，必须包含这些顶层字段：{required_keys_text}。\n"
+            "4. 保留中文内容与证据文本，不要擅自改写业务含义。\n\n"
+            f"[解析错误]\n{parse_error or '未提供'}\n\n"
+            "[待修复原文]\n"
+            f"{_compact_text_for_prompt(raw_text, 16000)}"
+        )
+        repaired_raw = self.ask_text(
+            repair_prompt,
+            task_label=(f"{task_label}(JSON修复)" if task_label else "JSON修复"),
+        )
+        data = extract_json_payload(repaired_raw, required_top_keys=required_top_keys)
+        if isinstance(data, dict):
+            missing = [k for k in required_top_keys if k not in data]
+            if missing:
+                raise OpenCodeCallError(f"缺少字段: {missing}")
+        return data
 
     def get_last_tool_calls(self) -> list[str]:
         return list(self._last_tool_calls)

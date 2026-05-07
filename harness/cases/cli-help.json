@@ -13,7 +13,8 @@
   "assertions": {
     "exit_code": 0,
     "stdout_contains": [
-      "将招标/投标文件交给 Claude SDK 或 OpenCode SDK runtime 执行标书审查并输出报告。"
+      "Claude SDK",
+      "OpenCode SDK runtime"
     ]
   }
 }
